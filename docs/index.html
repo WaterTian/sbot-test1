@@ -1,37 +1,43 @@
 <!doctype html>
 <html lang="zh-CN">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="description" content="开运二号（紫丁香三号）外观概念模型" />
-    <title>开运二号｜外观概念模型</title>
-    <link rel="stylesheet" href="styles.css" />
-  </head>
-  <body>
-    <main class="viewer-shell">
-      <header class="masthead">
-        <div>
-          <p class="eyebrow">GLOBAL UNIVERSITY SATELLITE ALLIANCE · CONCEPT STUDY</p>
-          <h1>开运二号 <span>/</span> 紫丁香三号</h1>
-        </div>
-        <p class="status"><i></i> EXTERIOR STUDY</p>
-      </header>
-
-      <section class="viewport" aria-label="可交互卫星模型">
-        <div id="canvas" aria-label="开运二号可旋转三维模型"></div>
-        <div class="model-note">
-          <b>碟形卫星</b>
-          <span>基于公开实物图的外观推定</span>
-        </div>
-        <div class="gesture-hint">拖动旋转 · 滚轮缩放</div>
-      </section>
-
-      <footer class="controls">
-        <button type="button" id="resetView">复位视角</button>
-        <button type="button" id="toggleRotate" aria-pressed="true">暂停自转</button>
-        <p>仅用于展示：尺寸、底面接口与内部结构未公开。</p>
-      </footer>
-    </main>
-    <script type="module" src="app.js"></script>
-  </body>
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="开运二号 / 紫丁香三号 · 可交互卫星外观概念展示">
+  <title>开运二号 · 轨道展厅</title>
+  <link rel="icon" href="data:,"><link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<main class="viewer-shell">
+  <header class="masthead">
+    <a class="brand" href="./" aria-label="轨道展厅首页"><span class="brand-mark" aria-hidden="true">O</span><span>轨道展厅<small>ORBITAL GALLERY</small></span></a>
+    <span class="collection">航天器外观研究 <span>/</span> 001</span>
+    <span class="edition">交互展品 · CONCEPT</span>
+  </header>
+  <section class="intro"><div><p class="eyebrow">SATELLITE EXTERIOR STUDY</p><h1>开运二号 <span>紫丁香三号</span></h1></div><p>从一个视角，走近每一处细节。<br><span>自由旋转、切换视角，探索碟形卫星的外观构成。</span></p></section>
+  <div class="workspace">
+    <section class="viewer-panel" aria-label="三维展厅">
+      <div class="viewer-top"><span class="live-status" id="viewerStatus">准备展品</span><span class="mono">3D / EXTERIOR</span></div>
+      <div class="viewport" aria-label="可交互卫星模型">
+        <div class="stage-grid" id="stageGrid" aria-hidden="true"></div>
+        <div id="canvas" tabindex="0" role="img" aria-label="开运二号可旋转三维模型。方向键旋转，加减键缩放，Home 复位。"></div>
+        <div id="loading" class="loading" role="status" aria-live="polite"><span class="spinner" aria-hidden="true"></span><span class="eyebrow">ORBITAL GALLERY</span><b>正在准备展品</b><small>准备三维渲染环境</small><button id="retry" type="button" hidden>重新加载</button></div>
+        <div class="corner-label"><span class="mono" id="viewLabel">01 / 自由视角</span><span>外观概念模型</span></div>
+        <div class="scale-mark" aria-hidden="true"><span>展示比例</span><i></i><span>非工程尺寸</span></div>
+        <div class="zoom-tools controls" aria-label="缩放操作"><button id="zoomIn" aria-label="放大模型" title="放大 (+)">+</button><button id="zoomOut" aria-label="缩小模型" title="缩小 (-)">−</button></div>
+      </div>
+      <div class="toolbar controls"><div class="segmented" aria-label="模型视角"><button id="resetView" aria-pressed="true">透视</button><button id="topView" aria-pressed="false">正面</button><button id="sideView" aria-pressed="false">侧面</button></div><div class="toolbar-actions"><button id="toggleRotate" aria-pressed="true">暂停自转</button><button id="fullscreen">全屏</button></div></div>
+      <div class="gesture-hint"><span>拖动旋转 · 滚轮 / 双指缩放</span><span>键盘方向键旋转 · Home 复位</span></div>
+    </section>
+    <aside class="inspector" aria-label="展品信息与展示设置">
+      <section class="info-section"><p class="eyebrow">THE OBJECT</p><h2>一枚碟形卫星</h2><p class="description">以公开实物图为参考，重建太阳能电池阵列、环形边框与外露组件之间的关系。</p><dl class="spec-list"><div><dt>展品类型</dt><dd>外观概念</dd></div><div><dt>外形特征</dt><dd>圆盘式主体</dd></div><div><dt>重建依据</dt><dd>公开实物参考图</dd></div></dl></section>
+      <section class="info-section part-section"><div class="section-heading"><h3>细节探索</h3><span class="mono">03 PARTS</span></div><p class="section-hint">选择部件，在模型中高亮查看</p><div class="part-list controls"><button class="part" data-part="solar" aria-pressed="false"><span class="part-number">01</span><span>太阳能电池阵列<small>表面铺设与单元间隙</small></span><span class="part-arrow" aria-hidden="true">↗</span></button><button class="part" data-part="frame" aria-pressed="false"><span class="part-number">02</span><span>环形结构<small>外缘框架与固定支架</small></span><span class="part-arrow" aria-hidden="true">↗</span></button><button class="part" data-part="equipment" aria-pressed="false"><span class="part-number">03</span><span>外露组件<small>设备外壳与连接线束</small></span><span class="part-arrow" aria-hidden="true">↗</span></button></div><p id="partDetail" class="part-detail" role="status">点击同一部件可取消高亮。</p></section>
+      <section class="info-section settings controls"><h3>展示设置</h3><label for="exposure">灯光亮度 <output id="exposureValue" for="exposure" class="mono">100%</output></label><input id="exposure" type="range" min="60" max="150" value="100" aria-label="灯光亮度"><label class="check-label"><span>辅助网格</span><input id="gridToggle" type="checkbox" checked></label></section>
+      <div class="disclaimer"><span class="mono">展示说明</span><p>本模型为外观推定，不代表制造结构。尺寸、底面接口与内部构造未经确认。</p></div>
+    </aside>
+  </div>
+  <footer class="page-footer"><span>开运二号 / 紫丁香三号</span><span>基于参考图重建 · 仅用于外观展示</span></footer>
+</main>
+<script type="importmap">{"imports":{"three":"./vendor/three.module.js","three/addons/controls/OrbitControls.js":"./vendor/OrbitControls.js"}}</script>
+<script src="boot.js" defer></script>
+</body>
 </html>
