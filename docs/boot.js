@@ -32,7 +32,7 @@
   requestAnimationFrame(() => requestAnimationFrame(() => {
     title.textContent = '正在装配模型';
     detail.textContent = '加载太阳能电池阵列与外露结构';
-    import('./app.js').catch(error => {
+    import('./app.js?v=20260905-2').catch(error => {
       console.error(error);
       window.viewerFailure('请检查网络与浏览器三维加速支持，然后重试。');
     });
