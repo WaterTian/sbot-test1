@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="开运二号（紫丁香三号）外观概念模型" />
+    <title>开运二号｜外观概念模型</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="viewer-shell">
+      <header class="masthead">
+        <div>
+          <p class="eyebrow">GLOBAL UNIVERSITY SATELLITE ALLIANCE · CONCEPT STUDY</p>
+          <h1>开运二号 <span>/</span> 紫丁香三号</h1>
+        </div>
+        <p class="status"><i></i> EXTERIOR STUDY</p>
+      </header>
+
+      <section class="viewport" aria-label="可交互卫星模型">
+        <div id="canvas" aria-label="开运二号可旋转三维模型"></div>
+        <div class="model-note">
+          <b>碟形卫星</b>
+          <span>基于公开实物图的外观推定</span>
+        </div>
+        <div class="gesture-hint">拖动旋转 · 滚轮缩放</div>
+      </section>
+
+      <footer class="controls">
+        <button type="button" id="resetView">复位视角</button>
+        <button type="button" id="toggleRotate" aria-pressed="true">暂停自转</button>
+        <p>仅用于展示：尺寸、底面接口与内部结构未公开。</p>
+      </footer>
+    </main>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

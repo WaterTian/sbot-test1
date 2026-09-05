@@ -1,0 +1,49 @@
+:root {
+  color-scheme: dark;
+  --ink: #e9f3fa;
+  --muted: #8da3b1;
+  --line: rgba(167, 199, 214, 0.2);
+  --gold: #d9a62a;
+  --surface: #071018;
+}
+
+* { box-sizing: border-box; }
+
+html, body { min-height: 100%; margin: 0; }
+
+body {
+  min-width: 320px;
+  background: radial-gradient(circle at 54% 36%, #182b3c 0%, #09131d 44%, #04080d 100%);
+  color: var(--ink);
+  font-family: Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+.viewer-shell { min-height: 100vh; display: grid; grid-template-rows: auto 1fr auto; padding: 30px clamp(20px, 5vw, 72px) 24px; }
+.masthead, .controls { display: flex; align-items: end; justify-content: space-between; gap: 24px; }
+.eyebrow { margin: 0 0 8px; color: #86a6ba; font-size: 11px; letter-spacing: .16em; }
+h1 { margin: 0; font-size: clamp(28px, 4vw, 56px); line-height: 1; font-weight: 650; letter-spacing: -.04em; }
+h1 span { color: var(--gold); font-weight: 300; }
+.status { display: flex; align-items: center; gap: 9px; margin: 0 0 5px; color: #9fb6c5; font-size: 11px; letter-spacing: .12em; }
+.status i { width: 7px; height: 7px; border-radius: 50%; background: #75d8a0; box-shadow: 0 0 14px #75d8a0; }
+
+.viewport { position: relative; min-height: min(68vh, 710px); margin: 12px 0; border: 1px solid var(--line); overflow: hidden; background: radial-gradient(ellipse at 50% 52%, rgba(35, 80, 104, .3), transparent 55%); }
+#canvas { position: absolute; inset: 0; }
+.model-note { position: absolute; left: 24px; bottom: 22px; display: grid; gap: 4px; padding-left: 14px; border-left: 2px solid var(--gold); pointer-events: none; }
+.model-note b { font-size: 14px; font-weight: 600; }
+.model-note span, .gesture-hint, .controls p { color: var(--muted); font-size: 12px; }
+.gesture-hint { position: absolute; right: 24px; bottom: 22px; pointer-events: none; }
+
+.controls { align-items: center; border-top: 1px solid var(--line); padding-top: 16px; }
+button { appearance: none; border: 1px solid rgba(217, 166, 42, .7); border-radius: 0; background: rgba(217, 166, 42, .1); color: #f7df9b; font: inherit; font-size: 13px; padding: 10px 14px; cursor: pointer; transition: background .18s ease; }
+button + button { margin-left: 8px; border-color: var(--line); color: #bdd0dc; background: transparent; }
+button:hover { background: rgba(217, 166, 42, .22); }
+.controls p { margin: 0; text-align: right; }
+
+@media (max-width: 620px) {
+  .viewer-shell { padding: 22px 16px 16px; }
+  .masthead { align-items: start; flex-direction: column; gap: 12px; }
+  .viewport { min-height: 62vh; }
+  .controls { align-items: start; flex-direction: column; gap: 12px; }
+  .controls p { text-align: left; }
+  .gesture-hint { display: none; }
+}

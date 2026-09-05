@@ -1,0 +1,30 @@
+# Kaiyun-2 concept materials
+newmtl body
+Kd 0.10 0.11 0.13
+Ks 0.35 0.35 0.35
+Ns 55
+
+newmtl rim
+Kd 0.73 0.50 0.10
+Ks 0.35 0.35 0.35
+Ns 75
+
+newmtl solar_cells
+Kd 0.015 0.055 0.095
+Ks 0.35 0.35 0.35
+Ns 25
+
+newmtl perimeter_modules
+Kd 0.65 0.65 0.61
+Ks 0.35 0.35 0.35
+Ns 70
+
+newmtl star_trackers
+Kd 0.72 0.19 0.08
+Ks 0.35 0.35 0.35
+Ns 70
+
+newmtl harness
+Kd 0.48 0.12 0.05
+Ks 0.35 0.35 0.35
+Ns 45
