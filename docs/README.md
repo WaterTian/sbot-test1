@@ -27,3 +27,7 @@
 ## Earth bathymetry 复刻（2026-09-09）
 
 `earth-bathymetry/` 是 AlteredQualia「Earth bathymetry」WebGL demo 的 Three.js r170 复刻，在线地址 `https://watertian.github.io/sbot-test1/earth-bathymetry/`。实现要点、操作键与对照原站的取舍见 `earth-bathymetry/README.md`；页面右下角标注了生成它的模型版本（Claude Fable 5.1）。
+
+---
+
+最后更新：2026-09-09
