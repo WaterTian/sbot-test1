@@ -23,3 +23,7 @@
 - 单文件交付包含完整脚本、样式及渲染依赖，适合下载打开；在线站点从 docs 部署。
 
 验证记录见 ../output/playwright/verify.cjs：320/390/768/1440px 无横向溢出，三视角、缩放、键盘、部件选择/取消、灯光、网格、全屏；模块加载失败后重试、延迟加载状态、模拟渲染上下文丢失后重试。截图位于 ../output/playwright/。
+
+## Earth bathymetry 复刻（2026-09-09）
+
+`earth-bathymetry/` 是 AlteredQualia「Earth bathymetry」WebGL demo 的 Three.js r170 复刻，在线地址 `https://watertian.github.io/sbot-test1/earth-bathymetry/`。实现要点、操作键与对照原站的取舍见 `earth-bathymetry/README.md`；页面右下角标注了生成它的模型版本（Claude Fable 5.1）。

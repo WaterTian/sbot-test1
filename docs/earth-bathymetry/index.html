@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<title>Earth bathymetry — Three.js replica</title>
+	<meta charset="utf-8">
+	<meta name="description" content="Interactive 3D rendering of Earth bathymetry (underwater equivalent of land topography) — Three.js re-implementation of the AlteredQualia demo">
+	<meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+	<meta name="apple-mobile-web-app-capable" content="yes">
+	<meta name="apple-mobile-web-app-status-bar-style" content="black">
+	<link rel="icon" href="data:,">
+	<style>
+		body {
+			color: #fff;
+			font-family: Monospace, monospace;
+			font-size: 13px;
+			font-weight: bold;
+			background-color: #000;
+			margin: 0;
+			padding: 0;
+			line-height: 1.5em;
+			overflow: hidden;
+		}
+		canvas { display: block; }
+		#info {
+			text-align: center;
+			color: #fff;
+			text-shadow: 1px 1px 6px rgba(0,0,0,0.75);
+			position: absolute;
+			top: 0; width: 100%;
+			padding: 5px 0;
+			z-index: 100;
+			pointer-events: none;
+		}
+		#info a { pointer-events: auto; padding: 6px 2px; margin: -6px -2px; }
+		.subinfo { color: rgba(255,255,255,0.5); display: inline; }
+		.key { color: rgba(255,255,255,0.75); }
+		#help { display: none; }
+		a { color: white; }
+		#stats {
+			position: absolute; bottom: 0; left: 0;
+			color: #8A93A6; font-size: 9px; line-height: 1;
+			padding: 4px 5px; z-index: 100;
+		}
+		#credit {
+			position: absolute; bottom: 0; right: 0;
+			color: rgba(255,255,255,0.5); font-weight: normal;
+			font-size: 11px; line-height: 1.4;
+			padding: 4px 8px; text-align: right; z-index: 100;
+			text-shadow: 1px 1px 6px rgba(0,0,0,0.75);
+		}
+		#credit b { color: rgba(255,255,255,0.75); font-weight: bold; }
+		#loading {
+			background: #0af; color: white;
+			padding: 0.25em 1em;
+			position: absolute; right: 0; top: 0; z-index: 200;
+		}
+		#nogl {
+			display: none; position: absolute; top: 40%; width: 100%;
+			text-align: center; color: #aaa; font-weight: normal;
+		}
+		@media (max-width: 600px) {
+			#loading { top: auto; bottom: 0; }
+		}
+	</style>
+</head>
+<body>
+	<div id="loading">Loading ...</div>
+
+	<div id="info">
+		Earth bathymetry <span class="subinfo">— Three.js replica of the demo by</span> <a href="https://alteredqualia.com/xg/examples/earth_bathymetry.html" target="_blank" rel="noopener">AlteredQualia</a>
+		<div class="subinfo">- Data from NASA <a href="https://visibleearth.nasa.gov/" target="_blank" rel="noopener">Blue Marble</a> (elevation not to scale)
+			<div id="help">
+				<span class="key">Z:</span> zoom,
+				<span class="key">W:</span> water,
+				<span class="key">R:</span> rotation,
+				<span class="key">U:</span> ultra,
+				<span class="key">P:</span> photo
+			</div>
+		</div>
+	</div>
+
+	<div id="stats"></div>
+	<div id="credit">
+		Replica built by SintBot · model <b>Claude Fable 5.1</b> (claude-fable-5-1) · Three.js r170 · 2026-09-09
+	</div>
+	<div id="nogl">Your browser does not support WebGL 2.</div>
+
+	<script type="importmap">
+		{ "imports": { "three": "./js/three.module.min.js" } }
+	</script>
+
+	<script type="module">
+		import * as THREE from 'three';
+
+		// ------------------------------------------------------------
+		// setup
+
+		const loadingEl = document.getElementById('loading');
+		const infoEl = document.getElementById('info');
+		const helpEl = document.getElementById('help');
+		const statsEl = document.getElementById('stats');
+
+		const testCanvas = document.createElement('canvas');
+		if (!testCanvas.getContext('webgl2')) {
+			loadingEl.style.display = 'none';
+			infoEl.style.display = 'none';
+			document.getElementById('nogl').style.display = 'block';
+			throw new Error('WebGL2 not available');
+		}
+
+		const ua = navigator.userAgent;
+		const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(ua) ||
+			(navigator.maxTouchPoints > 1 && /Mac/i.test(navigator.platform));
+		const dpr = window.devicePixelRatio || 1;
+
+		if (!isMobile) helpEl.style.display = 'block';
+
+		// world units: earth radius 50, elevation range 10 (not to scale), sea level at 55.5
+		const EARTH_R = 50;
+		const DISP_SCALE = 10;
+		const WATER_R = EARTH_R * 1.11;
+
+		const LOD_SEGMENTS = [[128, 64], [256, 128], [512, 256], [1024, 512], [2048, 1024]];
+		const fovArray = [17.5, 10, 17.5, 30];
+		let fovIndex = 0;
+
+		let currentLOD = isMobile ? 1 : 2;
+		let isUltra = false;
+		let isPhoto = false;
+		let hudVisible = true;
+		let rotationEnabled = true;
+
+		// backing pixels per CSS pixel
+		const SCALE_NORMAL = isMobile ? 0.8 : 1.0;
+		const SCALE_ULTRA = dpr;
+		const SCALE_PHOTO = 2 * dpr;
+		let renderScale = SCALE_NORMAL;
+
+		// camera controls (same feel as the original)
+		let mouseX = 0, mouseY = 0;
+		let angle = 0, height = 0;
+		let windowHalfX = window.innerWidth / 2;
+		let windowHalfY = window.innerHeight / 2;
+		const lookTarget = new THREE.Vector3();
+
+		// ------------------------------------------------------------
+		// renderer
+
+		const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' });
+		renderer.setClearColor(0x020202, 1);
+		renderer.toneMapping = THREE.ReinhardToneMapping;
+		renderer.toneMappingExposure = 2.5;
+		renderer.shadowMap.enabled = !isMobile;
+		renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+		renderer.domElement.style.position = 'absolute';
+		renderer.domElement.style.top = '0px';
+		document.body.appendChild(renderer.domElement);
+
+		const maxAniso = renderer.capabilities.getMaxAnisotropy();
+
+		// ------------------------------------------------------------
+		// camera & lights
+
+		const camera = new THREE.PerspectiveCamera(17.5, window.innerWidth / window.innerHeight, 50, 1500);
+		camera.position.set(0, 0, 380);
+
+		const sceneA = new THREE.Scene();          // terrain pass (to render target)
+		sceneA.background = new THREE.Color(0x020202);
+		const sceneB = new THREE.Scene();          // composite + water pass (to screen)
+
+		const sun = new THREE.DirectionalLight(0xffffff, 1.5 * Math.PI);
+		sun.position.set(0, 0.5, 1).multiplyScalar(500);
+		sun.castShadow = !isMobile;
+		sun.shadow.mapSize.set(2048, 2048);
+		sun.shadow.camera.near = 5;
+		sun.shadow.camera.far = 1500;
+		sun.shadow.camera.left = -75;
+		sun.shadow.camera.right = 75;
+		sun.shadow.camera.top = 75;
+		sun.shadow.camera.bottom = -75;
+		sun.shadow.bias = -0.0003;
+		sun.shadow.normalBias = 0.3;
+		sceneA.add(sun);
+		sceneA.add(sun.target);
+
+		const hemi = new THREE.HemisphereLight(0xffffff, 0x808080, 0.5 * Math.PI);
+		sceneA.add(hemi);
+
+		// ------------------------------------------------------------
+		// textures
+
+		let loadCounter = 0;
+		const manager = new THREE.LoadingManager(() => { loadingEl.style.display = 'none'; });
+		const loader = new THREE.TextureLoader(manager);
+		const res = isMobile ? '2k' : '4k';
+
+		const diffuseMap = loader.load(`textures/bathymetry_diffuse_${res}.jpg`);
+		const glossMap = loader.load(`textures/bathymetry_gloss_${res}.jpg`);
+		const heightMap = loader.load(`textures/bathymetry_bw_composite_${res}.jpg`);
+		const waterNormal = loader.load('textures/water-normal.jpg');
+
+		diffuseMap.colorSpace = THREE.SRGBColorSpace;
+		for (const t of [diffuseMap, glossMap, heightMap, waterNormal]) {
+			t.wrapS = t.wrapT = THREE.RepeatWrapping;
+			t.anisotropy = maxAniso;
+		}
+
+		// ------------------------------------------------------------
+		// earth
+
+		const meshRoot = new THREE.Object3D();
+		meshRoot.rotation.y = -0.35;
+		sceneA.add(meshRoot);
+
+		const earthMaterial = new THREE.MeshPhongMaterial({
+			color: 0xffffff,
+			map: diffuseMap,
+			specularMap: glossMap,
+			specular: new THREE.Color(0x222222),
+			shininess: 12,
+			displacementMap: heightMap,
+			displacementScale: DISP_SCALE,
+			bumpMap: isMobile ? null : heightMap,
+			bumpScale: 3.0
+		});
+
+		const spheres = [];
+		const planets = [];
+
+		function getSphere(lod) {
+			if (!spheres[lod]) {
+				const [w, h] = LOD_SEGMENTS[lod];
+				spheres[lod] = new THREE.SphereGeometry(EARTH_R, w, h);
+			}
+			return spheres[lod];
+		}
+
+		function addPlanet(lod) {
+			const mesh = new THREE.Mesh(getSphere(lod), earthMaterial);
+			mesh.castShadow = true;
+			mesh.receiveShadow = true;
+			meshRoot.add(mesh);
+			return mesh;
+		}
+
+		function setLOD(lod) {
+			if (!planets[lod]) planets[lod] = addPlanet(lod);
+			if (planets[currentLOD]) planets[currentLOD].visible = false;
+			planets[lod].visible = true;
+			currentLOD = lod;
+		}
+
+		planets[currentLOD] = addPlanet(currentLOD);
+
+		// ------------------------------------------------------------
+		// water presets (same parameter sets as the original, W cycles them)
+
+		// values tuned against screenshots of the original (same five moods: clear / clearer / murky / amber / grey)
+		const waterPresets = [
+			{ floor: 0.35, visibility: 25, fade: 0.8, shallow: [0.10, 0.42, 0.46], deep: [0.004, 0.020, 0.026], ext: [6, 30, 32] },
+			{ floor: 0.45, visibility: 35, fade: 0.7, shallow: [0.10, 0.42, 0.46], deep: [0.004, 0.020, 0.026], ext: [8, 40, 44] },
+			{ floor: 0.30, visibility: 10, fade: 1.0, shallow: [0.10, 0.42, 0.46], deep: [0.004, 0.020, 0.026], ext: [2.5, 12, 13] },
+			{ floor: 0.35, visibility: 25, fade: 0.8, shallow: [0.62, 0.40, 0.08], deep: [0.10, 0.012, 0.004], ext: [32, 16, 8] },
+			{ floor: 0.40, visibility: 30, fade: 0.8, shallow: [0.55, 0.55, 0.55], deep: [0.03, 0.03, 0.03], ext: [26, 26, 26] }
+		];
+		let waterIndex = 0;
+
+		// ------------------------------------------------------------
+		// render target for the terrain pass (colour + depth)
+
+		let rt = null;
+		const drawSize = new THREE.Vector2();
+
+		function buildRenderTarget() {
+			renderer.getDrawingBufferSize(drawSize);
+			const w = Math.max(1, drawSize.x), h = Math.max(1, drawSize.y);
+			if (rt) { rt.depthTexture.dispose(); rt.dispose(); }
+			const depthTexture = new THREE.DepthTexture(w, h);
+			depthTexture.type = THREE.UnsignedIntType;
+			rt = new THREE.WebGLRenderTarget(w, h, {
+				type: THREE.HalfFloatType,
+				depthTexture,
+				depthBuffer: true,
+				samples: isMobile ? 0 : 4
+			});
+			blitMaterial.uniforms.tScene.value = rt.texture;
+			waterMaterial.uniforms.tScene.value = rt.texture;
+			waterMaterial.uniforms.tDepth.value = rt.depthTexture;
+			blitMaterial.uniforms.resolution.value.set(w, h);
+			waterMaterial.uniforms.resolution.value.set(w, h);
+		}
+
+		// ------------------------------------------------------------
+		// composite pass: fullscreen blit of the terrain pass
+
+		const blitMaterial = new THREE.ShaderMaterial({
+			uniforms: { tScene: { value: null }, resolution: { value: new THREE.Vector2(1, 1) } },
+			vertexShader: `void main() { gl_Position = vec4(position.xy, 1.0, 1.0); }`,
+			fragmentShader: `
+				uniform sampler2D tScene;
+				uniform vec2 resolution;
+				void main() {
+					gl_FragColor = vec4(texture2D(tScene, gl_FragCoord.xy / resolution).rgb, 1.0);
+					#include <tonemapping_fragment>
+					#include <colorspace_fragment>
+				}`,
+			depthTest: false,
+			depthWrite: false
+		});
+		const blitGeo = new THREE.BufferGeometry();
+		blitGeo.setAttribute('position', new THREE.Float32BufferAttribute([-1, -1, 0, 3, -1, 0, -1, 3, 0], 3));
+		const blitMesh = new THREE.Mesh(blitGeo, blitMaterial);
+		blitMesh.frustumCulled = false;
+		blitMesh.renderOrder = -1;
+		sceneB.add(blitMesh);
+
+		// ------------------------------------------------------------
+		// water: screen-space refraction + depth-based extinction ("height fog" of the original)
+
+		const waterMaterial = new THREE.ShaderMaterial({
+			uniforms: {
+				tScene: { value: null },
+				tDepth: { value: null },
+				tNormal: { value: waterNormal },
+				resolution: { value: new THREE.Vector2(1, 1) },
+				cameraNear: { value: camera.near },
+				cameraFar: { value: camera.far },
+				time: { value: 0 },
+				sunDir: { value: new THREE.Vector3(0, 0, 1) },
+				shallowColor: { value: new THREE.Color() },
+				deepColor: { value: new THREE.Color() },
+				extinction: { value: new THREE.Vector3(7, 30, 40) },
+				visibility: { value: 50 },
+				fadeSpeed: { value: 0.5 },
+				unitScale: { value: 12.0 },
+				refractionScale: { value: 0.0275 },
+				normalScale: { value: 2.0 },
+				repeat: { value: new THREE.Vector2(4, 2) },
+				specularColor: { value: new THREE.Color(0.12, 0.12, 0.12) },
+				shininess: { value: 160.0 },
+				fresnelColor: { value: new THREE.Color(0.85, 0.9, 0.95) },
+				fresnelScale: { value: 0.05 },
+				rimThickness: { value: 10.0 },
+				floorDim: { value: 0.35 },
+				shoreWidth: { value: 0.02 }
+			},
+			vertexShader: `
+				varying vec2 vUv;
+				varying vec3 vWorldPos;
+				varying vec3 vViewPos;
+				varying vec3 vN;
+				varying vec3 vT;
+				varying vec3 vB;
+				void main() {
+					vUv = uv;
+					// analytic tangent (east direction) of the sphere parametrisation
+					vec3 t = vec3(position.z, 0.0, -position.x);
+					float tl = length(t);
+					t = tl > 1e-4 ? t / tl : vec3(1.0, 0.0, 0.0);
+					vec4 wp = modelMatrix * vec4(position, 1.0);
+					vWorldPos = wp.xyz;
+					vec4 vp = viewMatrix * wp;
+					vViewPos = vp.xyz;
+					vN = normalize(normalMatrix * normal);
+					vT = normalize(normalMatrix * t);
+					vB = normalize(cross(vN, vT));
+					gl_Position = projectionMatrix * vp;
+				}`,
+			fragmentShader: `
+				#include <packing>
+				uniform sampler2D tScene;
+				uniform sampler2D tDepth;
+				uniform sampler2D tNormal;
+				uniform vec2 resolution;
+				uniform float cameraNear;
+				uniform float cameraFar;
+				uniform float time;
+				uniform vec3 sunDir;
+				uniform vec3 shallowColor;
+				uniform vec3 deepColor;
+				uniform vec3 extinction;
+				uniform float visibility;
+				uniform float fadeSpeed;
+				uniform float unitScale;
+				uniform float refractionScale;
+				uniform float normalScale;
+				uniform vec2 repeat;
+				uniform vec3 specularColor;
+				uniform float shininess;
+				uniform vec3 fresnelColor;
+				uniform float fresnelScale;
+				uniform float rimThickness;
+				uniform float floorDim;
+				uniform float shoreWidth;
+				varying vec2 vUv;
+				varying vec3 vWorldPos;
+				varying vec3 vViewPos;
+				varying vec3 vN;
+				varying vec3 vT;
+				varying vec3 vB;
+
+				float viewZ(vec2 uv) {
+					float d = texture2D(tDepth, uv).x;
+					return -perspectiveDepthToViewZ(d, cameraNear, cameraFar);
+				}
+
+				void main() {
+					vec2 suv = gl_FragCoord.xy / resolution;
+					vec3 Ng = normalize(vN);
+					vec3 V = normalize(-vViewPos);
+					float surfDist = length(vViewPos);
+					float rayScale = surfDist / max(-vViewPos.z, 1e-3);
+
+					// animated wave normal (two scrolling layers of the normal map)
+					vec2 uv1 = vUv * repeat + vec2(time * 0.010, time * 0.006);
+					vec2 uv2 = vUv * repeat * 1.83 + vec2(-time * 0.008, time * 0.011);
+					vec3 n1 = texture2D(tNormal, uv1).xyz * 2.0 - 1.0;
+					vec3 n2 = texture2D(tNormal, uv2).xyz * 2.0 - 1.0;
+					vec3 nt = normalize(vec3((n1.xy + n2.xy) * 0.5 * normalScale, 1.0));
+					vec3 N = normalize(normalize(vT) * nt.x + normalize(vB) * nt.y + Ng * nt.z);
+
+					// terrain behind / in front of the water at this pixel
+					float z0 = viewZ(suv);
+					float terrainDist0 = z0 * rayScale;
+					vec3 sceneCol0 = texture2D(tScene, suv).rgb;
+					float land = 1.0 - smoothstep(-shoreWidth, shoreWidth, terrainDist0 - surfDist);
+
+					// refracted sample (reject samples of geometry in front of the surface)
+					vec2 ruv = suv + N.xy * refractionScale;
+					float zr = viewZ(ruv);
+					float terrainDist = zr * rayScale;
+					vec3 sceneCol = texture2D(tScene, ruv).rgb;
+					float zUsed = zr;
+					if (terrainDist < surfDist) { sceneCol = sceneCol0; terrainDist = terrainDist0; zUsed = z0; }
+
+					// path length through the water
+					float thickness;
+					if (zUsed > cameraFar * 0.999) {
+						// nothing behind: the ray leaves through the far side of the water shell
+						vec3 dirW = normalize(vWorldPos - cameraPosition);
+						thickness = min(-2.0 * dot(vWorldPos, dirW), rimThickness);
+						sceneCol = vec3(0.0);
+					} else {
+						thickness = max(terrainDist - surfDist, 0.0);
+					}
+					float th = thickness * unitScale;
+
+					vec3 T = exp(-th / extinction);
+					float inscatter = 1.0 - exp(-th / visibility);
+					float deepMix = 1.0 - exp(-th * fadeSpeed / visibility);
+					vec3 waterCol = mix(shallowColor, deepColor, deepMix);
+					// floorDim: light lost on the way down to the sea floor (uniform darkening under the surface)
+					vec3 col = sceneCol * floorDim * T + waterCol * inscatter;
+
+					// surface lighting: sun glint + fresnel
+					vec3 L = normalize(sunDir);
+					vec3 H = normalize(L + V);
+					float ndl = smoothstep(-0.1, 0.25, dot(Ng, L));
+					float spec = pow(max(dot(N, H), 0.0), shininess);
+					float fres = pow(1.0 - max(dot(Ng, V), 0.0), 5.0);
+					col += specularColor * spec * ndl;
+					col += fresnelColor * fres * fresnelScale * (0.3 + 0.7 * ndl);
+
+					col = mix(col, sceneCol0, land);
+					gl_FragColor = vec4(col, 1.0);
+					#include <tonemapping_fragment>
+					#include <colorspace_fragment>
+				}`,
+			depthTest: false,
+			depthWrite: false,
+			side: THREE.FrontSide
+		});
+
+		const waterMesh = new THREE.Mesh(new THREE.SphereGeometry(WATER_R, 256, 128), waterMaterial);
+		waterMesh.renderOrder = 0;
+		sceneB.add(waterMesh);
+
+		function applyWaterPreset(i) {
+			const p = waterPresets[i];
+			const u = waterMaterial.uniforms;
+			u.floorDim.value = p.floor;
+			u.visibility.value = p.visibility;
+			u.fadeSpeed.value = p.fade;
+			u.shallowColor.value.setRGB(p.shallow[0], p.shallow[1], p.shallow[2]);
+			u.deepColor.value.setRGB(p.deep[0], p.deep[1], p.deep[2]);
+			u.extinction.value.set(p.ext[0], p.ext[1], p.ext[2]);
+		}
+		applyWaterPreset(0);
+
+		buildRenderTarget();
+
+		// ------------------------------------------------------------
+		// controls
+
+		function toggleZoom() {
+			fovIndex = (fovIndex + 1) % fovArray.length;
+			camera.fov = fovArray[fovIndex];
+			camera.updateProjectionMatrix();
+		}
+		function toggleRotation() { rotationEnabled = !rotationEnabled; }
+		function toggleWater() {
+			waterIndex = (waterIndex + 1) % waterPresets.length;
+			applyWaterPreset(waterIndex);
+		}
+		function toggleHUD() {
+			hudVisible = !hudVisible;
+			infoEl.style.display = hudVisible ? 'block' : 'none';
+		}
+		function setScale(s) {
+			// cap the backing store at ~16 Mpx so photo mode cannot exhaust GPU memory
+			const px = window.innerWidth * window.innerHeight * s * s;
+			if (px > 16e6) s = Math.sqrt(16e6 / (window.innerWidth * window.innerHeight));
+			renderScale = s;
+			onWindowResize();
+		}
+		function toggleUltra() {
+			isUltra = !isUltra;
+			if (isUltra) { setLOD(3); setScale(SCALE_ULTRA); }
+			else { setLOD(2); setScale(SCALE_NORMAL); }
+		}
+		function togglePhoto() {
+			isPhoto = !isPhoto;
+			if (isPhoto) {
+				setLOD(4); setScale(SCALE_PHOTO);
+				infoEl.style.display = 'none'; hudVisible = false;
+			} else {
+				if (isUltra) { setLOD(3); setScale(SCALE_ULTRA); }
+				else { setLOD(2); setScale(SCALE_NORMAL); }
+				infoEl.style.display = 'block'; hudVisible = true;
+			}
+		}
+
+		document.addEventListener('keydown', (e) => {
+			if (e.ctrlKey || e.metaKey || e.altKey) return;
+			switch (e.key.toLowerCase()) {
+				case '1': setLOD(0); break;
+				case '2': setLOD(1); break;
+				case '3': setLOD(2); break;
+				case '4': setLOD(3); break;
+				case '5': setLOD(4); break;
+				case 'z': toggleZoom(); break;
+				case 'r': toggleRotation(); break;
+				case 'w': toggleWater(); break;
+				case 'u': toggleUltra(); break;
+				case 'p': togglePhoto(); break;
+				case 'h': toggleHUD(); break;
+			}
+		});
+
+		document.addEventListener('mousemove', (e) => {
+			mouseX = e.clientX - windowHalfX;
+			mouseY = e.clientY - windowHalfY;
+		});
+		renderer.domElement.addEventListener('touchmove', (e) => {
+			e.preventDefault();
+			const t = e.touches[0];
+			mouseX = t.clientX - windowHalfX;
+			mouseY = t.clientY - windowHalfY;
+		}, { passive: false });
+
+		function onWindowResize() {
+			const W = window.innerWidth, H = window.innerHeight;
+			windowHalfX = W / 2; windowHalfY = H / 2;
+			if (isMobile) camera.fov = W > H ? 17.5 : 30;
+			camera.aspect = W / H;
+			camera.updateProjectionMatrix();
+			renderer.setPixelRatio(renderScale);
+			renderer.setSize(W, H);
+			buildRenderTarget();
+		}
+		window.addEventListener('resize', onWindowResize);
+		onWindowResize();
+
+		// ------------------------------------------------------------
+		// loop
+
+		const clock = new THREE.Clock();
+		let fpsFrames = 0, fpsTime = 0;
+		const sunDirWorld = new THREE.Vector3();
+
+		function render() {
+			const rawDelta = clock.getDelta();
+			const delta = 0.125 * rawDelta;
+
+			const targetX = mouseX * 0.04;
+			const targetY = mouseY * 0.04;
+			angle += 0.05 * (targetX - angle);
+			height += 0.05 * (targetY - height);
+
+			const d = 380, n = 0.075;
+			camera.position.set(-Math.sin(angle * n) * d, 15.5 * height, Math.cos(angle * n) * d);
+			camera.lookAt(lookTarget);
+			camera.updateMatrixWorld();
+
+			if (rotationEnabled) meshRoot.rotation.y += delta;
+			waterMesh.rotation.y = meshRoot.rotation.y;
+
+			const u = waterMaterial.uniforms;
+			u.time.value = clock.elapsedTime;
+			u.cameraNear.value = camera.near;
+			u.cameraFar.value = camera.far;
+			sunDirWorld.copy(sun.position).normalize();
+			u.sunDir.value.copy(sunDirWorld).transformDirection(camera.matrixWorldInverse);
+
+			renderer.setRenderTarget(rt);
+			renderer.render(sceneA, camera);
+			renderer.setRenderTarget(null);
+			renderer.render(sceneB, camera);
+
+			fpsFrames++; fpsTime += rawDelta;
+			if (fpsTime >= 0.5) {
+				statsEl.textContent = Math.round(fpsFrames / fpsTime) + ' FPS';
+				fpsFrames = 0; fpsTime = 0;
+			}
+		}
+
+		renderer.setAnimationLoop(render);
+
+		// live tuning hooks
+		window.APP = {
+			THREE, renderer, camera, sun, hemi, earthMaterial, waterMaterial, meshRoot, waterMesh, render, setLOD, setScale, applyWaterPreset, waterPresets,
+			setMouse(x, y) { mouseX = x; mouseY = y; angle = x * 0.04; height = y * 0.04; },
+			setRotation(v, enabled) { meshRoot.rotation.y = v; if (enabled !== undefined) rotationEnabled = enabled; },
+			get loaded() { return loadingEl.style.display === 'none'; }
+		};
+	</script>
+</body>
+</html>
