@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+	<meta charset="utf-8">
+	<title>Earth bathymetry · Cesium 版</title>
+	<meta name="description" content="用 CesiumJS 实现的海底地形地球——与同项目的 Three.js 复刻版做对照">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<link rel="icon" href="data:,">
+
+	<script>window.CESIUM_BASE_URL = 'https://unpkg.com/cesium@1.145.0/Build/Cesium/';</script>
+	<link rel="stylesheet" href="https://unpkg.com/cesium@1.145.0/Build/Cesium/Widgets/widgets.css">
+	<script src="https://unpkg.com/cesium@1.145.0/Build/Cesium/Cesium.js"></script>
+
+	<style>
+		:root {
+			--bg: #0B0E14;
+			--surface: #151A23;
+			--primary: #E6EAF2;
+			--secondary: #8A93A6;
+			--accent: #2DD4BF;
+			--line: #232B38;
+			--warning: #F2B26B;
+		}
+		html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: var(--bg); }
+		body {
+			color: var(--primary);
+			font-family: 'IBM Plex Sans', 'PingFang SC', 'Hiragino Sans GB', 'Source Han Sans SC',
+				'Noto Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei', sans-serif;
+			font-size: 14px;
+			line-height: 1.7;
+		}
+		#globe { position: absolute; inset: 0; }
+
+		#panel {
+			position: absolute; top: 16px; left: 16px; z-index: 10;
+			width: 280px; max-width: calc(100vw - 32px);
+			background: var(--surface);
+			border: 1px solid var(--line);
+			border-radius: 10px;
+			padding: 16px;
+			box-sizing: border-box;
+		}
+		#panel h1 {
+			margin: 0 0 4px;
+			font-size: 16px; font-weight: 600; line-height: 1.4;
+		}
+		#panel .sub { color: var(--secondary); font-size: 13px; margin: 0 0 16px; }
+		.row { margin-bottom: 16px; }
+		.row:last-child { margin-bottom: 0; }
+		.row label {
+			display: flex; justify-content: space-between; align-items: baseline;
+			color: var(--secondary); font-size: 13px; margin-bottom: 8px;
+		}
+		.row label b {
+			color: var(--accent); font-weight: 500;
+			font-family: 'IBM Plex Mono', 'JetBrains Mono', ui-monospace, 'PingFang SC', 'Hiragino Sans GB', 'Source Han Sans SC', 'Noto Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei', monospace;
+		}
+		input[type=range] { width: 100%; accent-color: var(--accent); margin: 0; }
+		.btns { display: flex; gap: 8px; flex-wrap: wrap; }
+		button {
+			flex: 1 1 auto; min-height: 32px; padding: 6px 12px;
+			background: transparent; color: var(--primary);
+			border: 1px solid var(--line); border-radius: 6px;
+			font: inherit; font-size: 13px; cursor: pointer;
+		}
+		button:hover { border-color: var(--accent); color: var(--accent); }
+		button[aria-pressed=true] { border-color: var(--accent); color: var(--accent); }
+
+		#note {
+			margin-top: 16px; padding-top: 16px;
+			border-top: 1px solid var(--line);
+			color: var(--secondary); font-size: 13px;
+		}
+		#note a { color: var(--accent); }
+
+		#loading {
+			position: absolute; inset: 0; z-index: 20;
+			display: flex; align-items: center; justify-content: center;
+			background: var(--bg); color: var(--secondary);
+		}
+		#status {
+			position: absolute; right: 16px; bottom: 16px; z-index: 10;
+			color: var(--secondary); font-size: 13px; text-align: right;
+			font-family: 'IBM Plex Mono', 'JetBrains Mono', ui-monospace, 'PingFang SC', 'Hiragino Sans GB', 'Source Han Sans SC', 'Noto Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei', monospace;
+		}
+		/* Cesium 自带的版权行压在右下,挪开免得和状态行叠 */
+		.cesium-widget-credits { display: none !important; }
+		@media (max-width: 600px) {
+			#panel { width: auto; right: 16px; }
+			#status { display: none; }
+		}
+	</style>
+</head>
+<body>
+	<div id="globe"></div>
+
+	<div id="panel" hidden>
+		<h1>Earth bathymetry · Cesium 版</h1>
+		<p class="sub">与 Three.js 复刻版同源数据的对照实现</p>
+
+		<div class="row">
+			<label for="exag">地形垂直夸张 <b id="exagVal">10×</b></label>
+			<input type="range" id="exag" min="1" max="40" step="1" value="10">
+		</div>
+
+		<div class="row btns">
+			<button id="btnSea" aria-pressed="false">海平面壳</button>
+			<button id="btnLight" aria-pressed="true">日照</button>
+			<button id="btnHome">复位</button>
+		</div>
+
+		<div id="note">
+			高程与影像来自本项目 Three.js 版的同一批 NASA Blue Marble 贴图（4K），
+			经自定义地形源喂给 Cesium。<a href="../earth-bathymetry/">← 对比 Three.js 版</a>
+		</div>
+	</div>
+
+	<div id="status" hidden></div>
+	<div id="loading">正在装配地形…</div>
+
+	<script>
+	(async function () {
+		const loadingEl = document.getElementById('loading');
+		const panelEl = document.getElementById('panel');
+		const statusEl = document.getElementById('status');
+
+		const TEX = '../earth-bathymetry/textures/';
+		const HEIGHT_SRC = TEX + 'bathymetry_bw_composite_4k.jpg';
+		const IMAGERY_SRC = TEX + 'bathymetry_diffuse_4k.jpg';
+
+		// --------------------------------------------------------------
+		// 高程解码
+		// 这批合成图把陆地和海洋编码成两段独立的灰阶斜坡,中间在海岸线处有个台阶。
+		// 常数是拿已知地点(马里亚纳/大西洋中部/撒哈拉/南极高原/喜马拉雅)反解出来的近似值。
+		const SEA_TOP = 130;      // 海洋段的上端 = 海平面
+		const SEA_FLOOR = 8000;   // 灰度 0 对应的水深(米)
+		const LAND_BASE = 143;    // 陆地段的下端 = 海平面
+		const LAND_TOP = 7500;    // 灰度 255 对应的海拔(米)
+
+		function decode(g) {
+			if (g <= SEA_TOP) return -(SEA_TOP - g) / SEA_TOP * SEA_FLOOR;
+			if (g >= LAND_BASE) return (g - LAND_BASE) / (255 - LAND_BASE) * LAND_TOP;
+			return 0;             // 海岸带
+		}
+
+		// --------------------------------------------------------------
+		// 把高程图读进像素缓冲
+
+		function loadImage(src) {
+			return new Promise((res, rej) => {
+				const im = new Image();
+				im.onload = () => res(im);
+				im.onerror = () => rej(new Error('取不到 ' + src));
+				im.src = src;
+			});
+		}
+
+		const hImg = await loadImage(HEIGHT_SRC);
+		const hcv = document.createElement('canvas');
+		hcv.width = hImg.width; hcv.height = hImg.height;
+		const hctx = hcv.getContext('2d', { willReadFrequently: true });
+		hctx.drawImage(hImg, 0, 0);
+		const HW = hcv.width, HH = hcv.height;
+		const hpx = hctx.getImageData(0, 0, HW, HH).data;
+
+		// 双线性采样,免得瓦片之间出现台阶
+		function elevationAt(lon, lat) {
+			let u = (lon + 180) / 360;
+			u = u - Math.floor(u);                       // 经度回绕
+			const v = (90 - lat) / 180;
+			const x = u * (HW - 1);
+			const y = Math.min(Math.max(v, 0), 1) * (HH - 1);
+			const x0 = Math.floor(x), y0 = Math.floor(y);
+			const x1 = (x0 + 1) % HW, y1 = Math.min(y0 + 1, HH - 1);
+			const fx = x - x0, fy = y - y0;
+			const g = (px, py) => hpx[(py * HW + px) * 4];
+			const top = decode(g(x0, y0)) * (1 - fx) + decode(g(x1, y0)) * fx;
+			const bot = decode(g(x0, y1)) * (1 - fx) + decode(g(x1, y1)) * fx;
+			return top * (1 - fy) + bot * fy;
+		}
+
+		// --------------------------------------------------------------
+		// 自定义地形源:Cesium 按需要哪块就来问,我们现算现给
+
+		const tilingScheme = new Cesium.GeographicTilingScheme();
+		const TILE = 64;
+		// 4K 源图到第 6 级就没有更多细节了,再往下细分只是徒增瓦片
+		const MAX_LEVEL = 6;
+
+		const terrainProvider = new Cesium.CustomHeightmapTerrainProvider({
+			width: TILE,
+			height: TILE,
+			tilingScheme: tilingScheme,
+			callback: function (x, y, level) {
+				const rect = tilingScheme.tileXYToRectangle(x, y, level);
+				const out = new Float32Array(TILE * TILE);
+				for (let j = 0; j < TILE; j++) {
+					const lat = Cesium.Math.toDegrees(
+						Cesium.Math.lerp(rect.north, rect.south, j / (TILE - 1)));
+					for (let i = 0; i < TILE; i++) {
+						const lon = Cesium.Math.toDegrees(
+							Cesium.Math.lerp(rect.west, rect.east, i / (TILE - 1)));
+						out[j * TILE + i] = elevationAt(lon, lat);
+					}
+				}
+				return out;
+			}
+		});
+
+		// --------------------------------------------------------------
+		// 影像:同一批贴图铺满整球,全程不碰 Cesium ion(无 token、可离线)
+
+		const imagery = await Cesium.SingleTileImageryProvider.fromUrl(IMAGERY_SRC, {
+			rectangle: Cesium.Rectangle.MAX_VALUE,
+			tileWidth: 4096,
+			tileHeight: 2048
+		});
+
+		const viewer = new Cesium.Viewer('globe', {
+			baseLayer: new Cesium.ImageryLayer(imagery),
+			terrainProvider: terrainProvider,
+			// 下面这些控件要么依赖 ion,要么对这个演示没用
+			geocoder: false, baseLayerPicker: false, sceneModePicker: false,
+			navigationHelpButton: false, homeButton: false, fullscreenButton: false,
+			timeline: false, animation: false, infoBox: false, selectionIndicator: false,
+			creditContainer: document.createElement('div')
+		});
+
+		const scene = viewer.scene;
+		const globe = scene.globe;
+
+		scene.verticalExaggeration = 10;
+		scene.verticalExaggerationRelativeHeight = 0;   // 以海平面为基准放大
+		globe.enableLighting = true;
+		globe.maximumScreenSpaceError = 3;
+		// Cesium 的日照跟真实时间走。把钟停在太阳正对大西洋的时刻,
+		// 否则默认打开就是一片夜面 —— 这是它「按真实天文算」的代价。
+		viewer.clock.currentTime = Cesium.JulianDate.fromIso8601('2026-09-10T15:00:00Z');
+		viewer.clock.shouldAnimate = false;
+		scene.light.intensity = 3.0;
+		globe.lambertDiffuseMultiplier = 1.4;
+		globe.baseColor = Cesium.Color.fromCssColorString('#0B0E14');
+		scene.skyAtmosphere.show = true;
+		scene.globe.showGroundAtmosphere = true;
+		scene.screenSpaceCameraController.minimumZoomDistance = 200000;
+
+		// 海平面:一层半透明椭球壳。默认关着 —— 它会把整个球连同陆地一起蒙上一层,
+		// 这正是 Cesium 不自带「水下消光」的证据:要做成 Three.js 那版的效果,
+		// 得自己写后处理去拿深度图,而不是糊一层壳。
+		const R = Cesium.Ellipsoid.WGS84.radii;
+		const sea = viewer.entities.add({
+			show: false,
+			position: Cesium.Cartesian3.ZERO,
+			ellipsoid: {
+				radii: new Cesium.Cartesian3(R.x, R.y, R.z),
+				material: Cesium.Color.fromCssColorString('#0E5A6E').withAlpha(0.4),
+				outline: false
+			}
+		});
+
+		const HOME = Cesium.Cartesian3.fromDegrees(-40, 10, 24000000);
+		function goHome() {
+			viewer.camera.flyTo({ destination: HOME, duration: 1.4 });
+		}
+		viewer.camera.setView({ destination: HOME });
+
+		// --------------------------------------------------------------
+		// 控件
+
+		const exag = document.getElementById('exag');
+		const exagVal = document.getElementById('exagVal');
+		exag.addEventListener('input', () => {
+			scene.verticalExaggeration = Number(exag.value);
+			exagVal.textContent = exag.value + '×';
+		});
+
+		const btnSea = document.getElementById('btnSea');
+		btnSea.addEventListener('click', () => {
+			const on = btnSea.getAttribute('aria-pressed') !== 'true';
+			btnSea.setAttribute('aria-pressed', String(on));
+			sea.show = on;
+		});
+
+		const btnLight = document.getElementById('btnLight');
+		btnLight.addEventListener('click', () => {
+			const on = btnLight.getAttribute('aria-pressed') !== 'true';
+			btnLight.setAttribute('aria-pressed', String(on));
+			globe.enableLighting = on;
+		});
+
+		document.getElementById('btnHome').addEventListener('click', goHome);
+
+		// --------------------------------------------------------------
+		// 状态行:鼠标底下那一点的经纬度与海拔 —— Three.js 那版给不出这个
+
+		const handler = new Cesium.ScreenSpaceEventHandler(scene.canvas);
+		handler.setInputAction((movement) => {
+			const carto = scene.camera.pickEllipsoid(movement.endPosition, Cesium.Ellipsoid.WGS84);
+			if (!carto) { statusEl.textContent = ''; return; }
+			const c = Cesium.Cartographic.fromCartesian(carto);
+			const lon = Cesium.Math.toDegrees(c.longitude);
+			const lat = Cesium.Math.toDegrees(c.latitude);
+			const h = Math.round(elevationAt(lon, lat));
+			// 高程是从灰度贴图反解的近似值,不是权威高程数据,所以标 ≈
+			statusEl.textContent =
+				lat.toFixed(2) + '°, ' + lon.toFixed(2) + '°　' +
+				(h >= 0 ? '海拔 ≈ ' + h : '水深 ≈ ' + (-h)) + ' m';
+		}, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+
+		// --------------------------------------------------------------
+
+		await viewer.scene.globe.tileLoadProgressEvent.raiseEvent;
+		loadingEl.remove();
+		panelEl.hidden = false;
+		statusEl.hidden = false;
+
+		window.APP = {
+			Cesium, viewer, scene, elevationAt, decode, goHome,
+			get info() {
+				return {
+					exaggeration: scene.verticalExaggeration,
+					lighting: globe.enableLighting,
+					sea: sea.show,
+					tilesLoaded: globe.tilesLoaded,
+					// 实测有没有真的打到 ion 的服务器(库里带着默认 token,光看 token 说明不了问题)
+					ionRequests: performance.getEntriesByType('resource')
+						.filter((r) => /cesium\.com/.test(r.name)).length,
+					maxLevel: MAX_LEVEL
+				};
+			}
+		};
+	})().catch((err) => {
+		document.getElementById('loading').textContent = '起不来:' + err.message;
+		console.error(err);
+	});
+	</script>
+</body>
+</html>

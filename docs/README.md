@@ -28,6 +28,19 @@
 
 `earth-bathymetry/` 是 AlteredQualia「Earth bathymetry」WebGL demo 的 Three.js r170 复刻，在线地址 `https://watertian.github.io/sbot-test1/earth-bathymetry/`。实现要点、操作键与对照原站的取舍见 `earth-bathymetry/README.md`；页面右下角标注了生成它的模型版本（Claude Fable 5.1）。
 
+## Earth bathymetry · Cesium 对照版（2026-09-10）
+
+`cesium-earth/` 用 CesiumJS 1.145 做了同一份数据的另一种实现，在线地址
+`https://watertian.github.io/sbot-test1/cesium-earth/`，用来和 `earth-bathymetry/`（Three.js）对照。
+
+- 高程与影像复用 `earth-bathymetry/textures/` 里那批 4K 贴图，不重复占空间。
+- 高程从灰度合成图反解：陆地和海洋是两段独立的灰阶斜坡，海岸线处有台阶；常数由已知地点标定，是近似值，状态行因此标 `≈`。
+- 自定义地形源（CustomHeightmapTerrainProvider）按瓦片现算高程，双线性采样避免瓦片接缝。
+- 全程不请求 Cesium ion：影像用 SingleTileImageryProvider 走本地贴图，依赖 ion 的控件全部关掉。页面里可实测 `APP.info.ionRequests` 为 0。
+- Cesium 库走 CDN，未随仓库分发（1.145 解包约 79MB）。离线内网部署需要自行托管这套文件。
+- 「海平面壳」默认关闭：一层均匀半透明壳会把陆地一起蒙住，说明 Cesium 不自带水下消光，那个效果得自己写后处理。
+
+
 ---
 
-最后更新：2026-09-09
+最后更新：2026-09-10
