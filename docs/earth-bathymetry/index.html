@@ -72,9 +72,9 @@
 		Earth bathymetry <span class="subinfo">— Three.js replica of the demo by</span> <a href="https://alteredqualia.com/xg/examples/earth_bathymetry.html" target="_blank" rel="noopener">AlteredQualia</a>
 		<div class="subinfo">- Data from NASA <a href="https://visibleearth.nasa.gov/" target="_blank" rel="noopener">Blue Marble</a> (elevation not to scale)
 			<div id="help">
-				<span class="key">Drag:</span> orbit,
-				<span class="key">Wheel:</span> zoom,
-				<span class="key">Double-click:</span> reset,
+				<span class="key">Drag</span> / <span class="key">Arrows:</span> orbit,
+				<span class="key">Wheel</span> / <span class="key">+&minus;:</span> zoom,
+				<span class="key">Home:</span> reset,
 				<span class="key">Z:</span> zoom,
 				<span class="key">W:</span> water,
 				<span class="key">R:</span> rotation,
@@ -150,6 +150,8 @@
 		let isDragging = false;
 		let lastPtrX = 0, lastPtrY = 0;
 		let pinchDist = 0;
+		let dragMoved = 0;                   // total travel of the current drag, to tell a tap from a drag
+		let lastTapAt = 0;
 		let targetFov = fovArray[0];         // wheel / pinch zoom, camera.fov eases toward it
 		let userZoomed = false;
 		const FOV_MIN = 6, FOV_MAX = 40;
@@ -158,6 +160,14 @@
 		let windowHalfY = window.innerHeight / 2;
 		const lookTarget = new THREE.Vector3();
 		const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+
+		// auto-rotation yields while you interact, then eases back in after a pause
+		let idleTime = 99;
+		let autoSpin = 1;
+		const RESUME_AFTER = 2.5;            // seconds of no input before the spin returns
+		const MAX_SPIN_STEP = 0.12;          // guards against a single huge pointer jump flinging the globe
+		const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+		const noteInteraction = () => { idleTime = 0; };
 
 		// ------------------------------------------------------------
 		// renderer
@@ -519,12 +529,14 @@
 		function zoomBy(factor) {
 			targetFov = clamp(targetFov * factor, FOV_MIN, FOV_MAX);
 			userZoomed = true;
+			noteInteraction();
 		}
 		function resetView() {
 			dragAz = dragEl = spinAz = spinEl = 0;
 			fovIndex = 0;
 			targetFov = fovArray[0];
 			userZoomed = false;
+			noteInteraction();
 		}
 		function toggleRotation() { rotationEnabled = !rotationEnabled; }
 		function toggleWater() {
@@ -559,9 +571,28 @@
 			}
 		}
 
+		// keyboard orbit / zoom — same vocabulary as the Kaiyun-2 viewer in this project
+		function orbitBy(dAz, dEl) {
+			const k = 0.09 * (camera.fov / fovArray[0]);
+			dragAz += dAz * k;
+			dragEl = clamp(dragEl + dEl * k, -EL_LIMIT, EL_LIMIT);
+			spinAz = spinEl = 0;
+			noteInteraction();
+		}
+
 		document.addEventListener('keydown', (e) => {
 			if (e.ctrlKey || e.metaKey || e.altKey) return;
+			switch (e.key) {
+				case 'ArrowLeft':  e.preventDefault(); orbitBy(-1, 0); return;
+				case 'ArrowRight': e.preventDefault(); orbitBy(1, 0); return;
+				case 'ArrowUp':    e.preventDefault(); orbitBy(0, -1); return;
+				case 'ArrowDown':  e.preventDefault(); orbitBy(0, 1); return;
+				case '+': case '=': zoomBy(0.9); return;
+				case '-': case '_': zoomBy(1 / 0.9); return;
+				case 'Home': e.preventDefault(); resetView(); return;
+			}
 			switch (e.key.toLowerCase()) {
+				case '0': resetView(); break;
 				case '1': setLOD(0); break;
 				case '2': setLOD(1); break;
 				case '3': setLOD(2); break;
@@ -587,23 +618,28 @@
 
 		// drag to orbit (pointer events cover mouse, pen and single-finger touch)
 		canvas.addEventListener('pointerdown', (e) => {
+			if (e.pointerType === 'mouse' && e.button !== 0) return;   // left button only
 			if (e.pointerType === 'touch' && pinchDist > 0) return;
 			isDragging = true;
 			spinAz = spinEl = 0;
 			lastPtrX = e.clientX; lastPtrY = e.clientY;
+			dragMoved = 0;
 			canvas.setPointerCapture(e.pointerId);
 			canvas.classList.add('grabbing');
+			noteInteraction();
 		});
 		canvas.addEventListener('pointermove', (e) => {
 			if (!isDragging) return;
 			const dx = e.clientX - lastPtrX, dy = e.clientY - lastPtrY;
 			lastPtrX = e.clientX; lastPtrY = e.clientY;
+			dragMoved += Math.abs(dx) + Math.abs(dy);
 			// scale by fov so dragging stays proportional when zoomed in
 			const k = 0.004 * (camera.fov / fovArray[0]);
-			spinAz = dx * k;
-			spinEl = dy * k;
+			spinAz = clamp(dx * k, -MAX_SPIN_STEP, MAX_SPIN_STEP);
+			spinEl = clamp(dy * k, -MAX_SPIN_STEP, MAX_SPIN_STEP);
 			dragAz += spinAz;
 			dragEl = clamp(dragEl + spinEl, -EL_LIMIT, EL_LIMIT);
+			noteInteraction();
 		});
 		const endDrag = (e) => {
 			if (!isDragging) return;
@@ -640,6 +676,14 @@
 			if (pinchDist > 0 && d2 > 0) zoomBy(pinchDist / d2);
 			pinchDist = d2;
 		}, { passive: false });
+		// double-tap to reset (dblclick is unreliable on touch); a tap is a press that barely moved
+		canvas.addEventListener('touchend', (e) => {
+			if (e.touches.length || e.changedTouches.length !== 1 || dragMoved > 12) return;
+			const now = performance.now();
+			if (now - lastTapAt < 300) resetView();
+			lastTapAt = now;
+		}, { passive: true });
+
 		const endPinch = (e) => { if (e.touches.length < 2) pinchDist = 0; };
 		canvas.addEventListener('touchend', endPinch, { passive: true });
 		canvas.addEventListener('touchcancel', endPinch, { passive: true });
@@ -674,18 +718,25 @@
 			angle += 0.05 * (targetX - angle);
 			height += 0.05 * (targetY - height);
 
+			const calm = reduceMotion.matches;
+			idleTime += rawDelta;
+
 			// inertia: keep coasting after the pointer is released
 			if (!isDragging && (spinAz || spinEl)) {
-				dragAz += spinAz;
-				dragEl = clamp(dragEl + spinEl, -EL_LIMIT, EL_LIMIT);
-				spinAz *= 0.93; spinEl *= 0.93;
-				if (Math.abs(spinAz) < 1e-5) spinAz = 0;
-				if (Math.abs(spinEl) < 1e-5) spinEl = 0;
+				if (calm) {
+					spinAz = spinEl = 0;
+				} else {
+					dragAz += spinAz;
+					dragEl = clamp(dragEl + spinEl, -EL_LIMIT, EL_LIMIT);
+					spinAz *= 0.93; spinEl *= 0.93;
+					if (Math.abs(spinAz) < 1e-5) spinAz = 0;
+					if (Math.abs(spinEl) < 1e-5) spinEl = 0;
+				}
 			}
 
 			// eased zoom
 			if (Math.abs(camera.fov - targetFov) > 1e-3) {
-				camera.fov += (targetFov - camera.fov) * 0.15;
+				camera.fov += calm ? (targetFov - camera.fov) : (targetFov - camera.fov) * 0.15;
 				camera.updateProjectionMatrix();
 			}
 
@@ -697,7 +748,10 @@
 			camera.lookAt(lookTarget);
 			camera.updateMatrixWorld();
 
-			if (rotationEnabled) meshRoot.rotation.y += delta;
+			// auto-spin backs off the moment you touch it, then eases back in after a pause
+			const wantSpin = (rotationEnabled && !calm && !isDragging && idleTime > RESUME_AFTER) ? 1 : 0;
+			autoSpin += (wantSpin - autoSpin) * (wantSpin > autoSpin ? 0.015 : 0.25);
+			meshRoot.rotation.y += delta * autoSpin;
 			waterMesh.rotation.y = meshRoot.rotation.y;
 
 			const u = waterMaterial.uniforms;
@@ -729,8 +783,12 @@
 				mouseX = x; mouseY = y; angle = x * 0.04; height = y * 0.04;
 				dragAz = dragEl = spinAz = spinEl = 0;
 			},
-			setRotation(v, enabled) { meshRoot.rotation.y = v; if (enabled !== undefined) rotationEnabled = enabled; },
-			get view() { return { fov: camera.fov, targetFov, dragAz, dragEl, dragging: isDragging }; },
+			orbitBy,
+			setRotation(v, enabled) {
+				meshRoot.rotation.y = v;
+				if (enabled !== undefined) { rotationEnabled = enabled; autoSpin = enabled ? 1 : 0; }
+			},
+			get view() { return { fov: camera.fov, targetFov, dragAz, dragEl, dragging: isDragging, autoSpin, idleTime, calm: reduceMotion.matches }; },
 			get loaded() { return loadingEl.style.display === 'none'; }
 		};
 	</script>
