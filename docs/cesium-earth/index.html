@@ -7,9 +7,7 @@
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
 	<link rel="icon" href="data:,">
 
-	<script>window.CESIUM_BASE_URL = 'https://unpkg.com/cesium@1.145.0/Build/Cesium/';</script>
-	<link rel="stylesheet" href="https://unpkg.com/cesium@1.145.0/Build/Cesium/Widgets/widgets.css">
-	<script src="https://unpkg.com/cesium@1.145.0/Build/Cesium/Cesium.js"></script>
+	<!-- Cesium 库不在这里同步引入:由下面脚本挑镜像动态加载,贴图同时开始下载,不用排在 5.9 MB 的库后面 -->
 
 	<style>
 		:root {
@@ -283,6 +281,31 @@
 		}
 	`;
 
+	// Cesium 库从哪取:先走国内的 npmmirror(实测 5.9 MB 的库 0.5 s 下完,unpkg 要 3~5 s),
+	// 取不到再退回 unpkg。CESIUM_BASE_URL 跟着实际用上的那个走,Workers 和 Assets 也从那里取
+	const CESIUM_CDNS = [
+		'https://registry.npmmirror.com/cesium/1.145.0/files/Build/Cesium/',
+		'https://unpkg.com/cesium@1.145.0/Build/Cesium/'
+	];
+	function loadCesium(i = 0) {
+		const base = CESIUM_CDNS[i];
+		window.CESIUM_BASE_URL = base;
+		const css = document.createElement('link');
+		css.rel = 'stylesheet';
+		css.href = base + 'Widgets/widgets.css';
+		const js = document.createElement('script');
+		js.src = base + 'Cesium.js';
+		// 样式取不到不致命,只等它结束;库本体取不到才换下一个源
+		const cssDone = new Promise((r) => { css.onload = css.onerror = r; });
+		const jsDone = new Promise((r, j) => { js.onload = r; js.onerror = j; });
+		document.head.append(css, js);
+		return Promise.all([cssDone, jsDone]).then(() => base, () => {
+			css.remove(); js.remove();
+			if (i + 1 < CESIUM_CDNS.length) return loadCesium(i + 1);
+			throw new Error('Cesium 库加载失败');
+		});
+	}
+
 	(async function () {
 		const loadingEl = document.getElementById('loading');
 		const panelEl = document.getElementById('panel');
@@ -290,7 +313,11 @@
 
 		const TEX = '../earth-bathymetry/textures/';
 		const HEIGHT_SRC = TEX + 'bathymetry_bw_composite_4k.jpg';
-		const IMAGERY_SRC = TEX + 'bathymetry_diffuse_4k.jpg';
+		// 陆地提亮后的影像,离线烘好(以前每次打开都在浏览器里现调现压 JPEG,M4 上也要 1.1 s)。
+		// 调子:原 4K 贴图按线性光提亮 2.6 倍,再用肩部 x/(1+x·(G−1)/G) 把白色压回 1,存 WebP q85。
+		// 提亮的原因:关掉地面大气后陆地偏暗(亚马孙实测只有 Three.js 版的约 0.4 倍);
+		// 海底浮雕一起提亮 —— 水体着色器拿它当海底颜色,正对应 Three.js 版里被照亮的海床
+		const IMAGERY_SRC = 'textures/diffuse_toned_4k.webp';
 		const NORMAL_SRC = TEX + 'water-normal.jpg';
 
 		// --------------------------------------------------------------
@@ -317,15 +344,32 @@
 			});
 		}
 
-		loadingEl.textContent = '正在读取贴图…';
-		const [hImg, dImg] = await Promise.all([loadImage(HEIGHT_SRC), loadImage(IMAGERY_SRC)]);
+		loadingEl.textContent = '正在加载地球库与贴图…';
+		const timing = {};
+		const stamp = (k) => (v) => { timing[k] = Math.round(performance.now()); return v; };
+		// 高程图、影像、Cesium 库三样并行下载,谁也不等谁
+		const [hImg, imageryBlob, cdn] = await Promise.all([
+			loadImage(HEIGHT_SRC).then(stamp('heightMs')),
+			fetch(IMAGERY_SRC).then((r) => {
+				if (!r.ok) throw new Error('取不到 ' + IMAGERY_SRC);
+				return r.blob();
+			}).then(stamp('imageryMs')),
+			loadCesium().then(stamp('cesiumMs'))
+		]);
 
-		const hcv = document.createElement('canvas');
-		hcv.width = hImg.width; hcv.height = hImg.height;
-		const hctx = hcv.getContext('2d', { willReadFrequently: true });
-		hctx.drawImage(hImg, 0, 0);
-		const HW = hcv.width, HH = hcv.height;
-		const hpx = hctx.getImageData(0, 0, HW, HH).data;
+		const HW = hImg.width, HH = hImg.height;
+		// 只留灰度那一个通道(16 MB),整张 RGBA(64 MB)用完就放掉;灰度 → 米 先查好表
+		const hpx = new Uint8Array(HW * HH);
+		{
+			const hcv = document.createElement('canvas');
+			hcv.width = HW; hcv.height = HH;
+			const hctx = hcv.getContext('2d', { willReadFrequently: true });
+			hctx.drawImage(hImg, 0, 0);
+			const rgba = hctx.getImageData(0, 0, HW, HH).data;
+			for (let i = 0; i < hpx.length; i++) hpx[i] = rgba[i * 4];
+		}
+		const HEIGHT_OF = new Float32Array(256);
+		for (let g = 0; g < 256; g++) HEIGHT_OF[g] = decode(g);
 
 		// 双线性采样,免得瓦片之间出现台阶
 		function elevationAt(lon, lat) {
@@ -337,58 +381,11 @@
 			const x0 = Math.floor(x), y0 = Math.floor(y);
 			const x1 = (x0 + 1) % HW, y1 = Math.min(y0 + 1, HH - 1);
 			const fx = x - x0, fy = y - y0;
-			const g = (px, py) => hpx[(py * HW + px) * 4];
-			const top = decode(g(x0, y0)) * (1 - fx) + decode(g(x1, y0)) * fx;
-			const bot = decode(g(x0, y1)) * (1 - fx) + decode(g(x1, y1)) * fx;
+			const g = (px, py) => HEIGHT_OF[hpx[py * HW + px]];
+			const top = g(x0, y0) * (1 - fx) + g(x1, y0) * fx;
+			const bot = g(x0, y1) * (1 - fx) + g(x1, y1) * fx;
 			return top * (1 - fy) + bot * fy;
 		}
-
-		// --------------------------------------------------------------
-		// 影像调子:关掉地面大气后陆地偏暗(亚马孙实测只有 Three.js 版的约 0.4 倍亮度)。
-		// 按线性光提亮 2.6 倍,再用一段肩部把白色压回 1,雪和沙漠不会过曝发白。
-		// 海底浮雕一起提亮 —— 水体着色器拿它当海底颜色,正对应 Three.js 版里被照亮的海床
-
-		const srgbToLin = new Float32Array(256);
-		for (let i = 0; i < 256; i++) {
-			const c = i / 255;
-			srgbToLin[i] = c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
-		}
-		const LIN_STEPS = 4096;
-		const linToSrgb = new Uint8Array(LIN_STEPS + 1);
-		for (let i = 0; i <= LIN_STEPS; i++) {
-			const c = i / LIN_STEPS;
-			const v = c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
-			linToSrgb[i] = Math.round(Math.min(1, Math.max(0, v)) * 255);
-		}
-
-		const LAND = { gain: 2.6 };
-		const toneLUT = new Uint8Array(256);
-		{
-			const shoulder = (LAND.gain - 1) / LAND.gain;
-			for (let v = 0; v < 256; v++) {
-				const x = srgbToLin[v] * LAND.gain;
-				const y = x / (1 + x * shoulder);
-				toneLUT[v] = linToSrgb[Math.min(LIN_STEPS, (y * LIN_STEPS) | 0)];
-			}
-		}
-
-		loadingEl.textContent = '正在调影像…';
-		await new Promise((r) => setTimeout(r, 0));       // 先让提示画出来
-		const dcv = document.createElement('canvas');
-		dcv.width = dImg.width; dcv.height = dImg.height;
-		const dctx = dcv.getContext('2d', { willReadFrequently: true });
-		dctx.drawImage(dImg, 0, 0);
-		const dData = dctx.getImageData(0, 0, dcv.width, dcv.height);
-		const toneStart = performance.now();
-		{
-			const s = dData.data;
-			for (let i = 0; i < s.length; i += 4) {
-				s[i] = toneLUT[s[i]]; s[i + 1] = toneLUT[s[i + 1]]; s[i + 2] = toneLUT[s[i + 2]];
-			}
-		}
-		const toneMs = Math.round(performance.now() - toneStart);
-		dctx.putImageData(dData, 0, 0);
-		const TONED_SRC = URL.createObjectURL(await new Promise((r) => dcv.toBlob(r, 'image/jpeg', 0.92)));
 
 		// --------------------------------------------------------------
 		// 自定义地形源:Cesium 按需要哪块就来问,我们现算现给
@@ -422,10 +419,10 @@
 		// --------------------------------------------------------------
 		// 影像:同一批贴图铺满整球,全程不碰 Cesium ion(无 token、可离线)
 
-		const imagery = await Cesium.SingleTileImageryProvider.fromUrl(TONED_SRC, {
+		const imagery = await Cesium.SingleTileImageryProvider.fromUrl(URL.createObjectURL(imageryBlob), {
 			rectangle: Cesium.Rectangle.MAX_VALUE,
-			tileWidth: dImg.width,
-			tileHeight: dImg.height
+			tileWidth: 4096,
+			tileHeight: 2048
 		});
 
 		const viewer = new Cesium.Viewer('globe', {
@@ -569,9 +566,14 @@
 		loadingEl.remove();
 		panelEl.hidden = false;
 		statusEl.hidden = false;
+		timing.readyMs = Math.round(performance.now());
+		// 首屏瓦片全部到位的时刻,量加载性能用
+		const offTiles = globe.tileLoadProgressEvent.addEventListener((queued) => {
+			if (queued === 0 && globe.tilesLoaded) { timing.tilesMs = Math.round(performance.now()); offTiles(); }
+		});
 
 		window.APP = {
-			Cesium, viewer, scene, elevationAt, decode, goHome, waterStage, WATER, LAND,
+			Cesium, viewer, scene, elevationAt, decode, goHome, waterStage, WATER,
 			get info() {
 				return {
 					exaggeration: scene.verticalExaggeration,
@@ -580,7 +582,8 @@
 					waterReady: waterStage.ready,
 					waves: wavesOn,
 					logDepth: scene.logarithmicDepthBuffer,
-					toneMs: toneMs,
+					cdn: cdn,
+					timing: timing,
 					tilesLoaded: globe.tilesLoaded,
 					// 实测有没有真的打到 ion 的服务器(库里带着默认 token,光看 token 说明不了问题)
 					ionRequests: performance.getEntriesByType('resource')
