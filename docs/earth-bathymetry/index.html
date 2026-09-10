@@ -20,7 +20,8 @@
 			line-height: 1.5em;
 			overflow: hidden;
 		}
-		canvas { display: block; }
+		canvas { display: block; cursor: grab; touch-action: none; }
+		canvas.grabbing { cursor: grabbing; }
 		#info {
 			text-align: center;
 			color: #fff;
@@ -42,6 +43,7 @@
 			padding: 4px 5px; z-index: 100;
 		}
 		#credit {
+			display: none;   /* shown once loading finishes — otherwise the two collide on narrow screens */
 			position: absolute; bottom: 0; right: 0;
 			color: rgba(255,255,255,0.5); font-weight: normal;
 			font-size: 11px; line-height: 1.4;
@@ -70,6 +72,9 @@
 		Earth bathymetry <span class="subinfo">— Three.js replica of the demo by</span> <a href="https://alteredqualia.com/xg/examples/earth_bathymetry.html" target="_blank" rel="noopener">AlteredQualia</a>
 		<div class="subinfo">- Data from NASA <a href="https://visibleearth.nasa.gov/" target="_blank" rel="noopener">Blue Marble</a> (elevation not to scale)
 			<div id="help">
+				<span class="key">Drag:</span> orbit,
+				<span class="key">Wheel:</span> zoom,
+				<span class="key">Double-click:</span> reset,
 				<span class="key">Z:</span> zoom,
 				<span class="key">W:</span> water,
 				<span class="key">R:</span> rotation,
@@ -99,6 +104,7 @@
 		const infoEl = document.getElementById('info');
 		const helpEl = document.getElementById('help');
 		const statsEl = document.getElementById('stats');
+		const creditEl = document.getElementById('credit');
 
 		const testCanvas = document.createElement('canvas');
 		if (!testCanvas.getContext('webgl2')) {
@@ -136,12 +142,22 @@
 		const SCALE_PHOTO = 2 * dpr;
 		let renderScale = SCALE_NORMAL;
 
-		// camera controls (same feel as the original)
-		let mouseX = 0, mouseY = 0;
-		let angle = 0, height = 0;
+		// camera controls (passive parallax keeps the original's feel; drag / wheel add on top of it)
+		let mouseX = 0, mouseY = 0;          // parallax target, frozen while dragging
+		let angle = 0, height = 0;           // eased parallax
+		let dragAz = 0, dragEl = 0;          // accumulated by dragging
+		let spinAz = 0, spinEl = 0;          // leftover velocity → inertia after release
+		let isDragging = false;
+		let lastPtrX = 0, lastPtrY = 0;
+		let pinchDist = 0;
+		let targetFov = fovArray[0];         // wheel / pinch zoom, camera.fov eases toward it
+		let userZoomed = false;
+		const FOV_MIN = 6, FOV_MAX = 40;
+		const EL_LIMIT = 1.25;               // keep the camera off the poles
 		let windowHalfX = window.innerWidth / 2;
 		let windowHalfY = window.innerHeight / 2;
 		const lookTarget = new THREE.Vector3();
+		const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
 
 		// ------------------------------------------------------------
 		// renderer
@@ -190,7 +206,10 @@
 		// textures
 
 		let loadCounter = 0;
-		const manager = new THREE.LoadingManager(() => { loadingEl.style.display = 'none'; });
+		const manager = new THREE.LoadingManager(() => {
+			loadingEl.style.display = 'none';
+			creditEl.style.display = 'block';
+		});
 		const loader = new THREE.TextureLoader(manager);
 		const res = isMobile ? '2k' : '4k';
 
@@ -494,8 +513,18 @@
 
 		function toggleZoom() {
 			fovIndex = (fovIndex + 1) % fovArray.length;
-			camera.fov = fovArray[fovIndex];
-			camera.updateProjectionMatrix();
+			targetFov = fovArray[fovIndex];
+			userZoomed = true;
+		}
+		function zoomBy(factor) {
+			targetFov = clamp(targetFov * factor, FOV_MIN, FOV_MAX);
+			userZoomed = true;
+		}
+		function resetView() {
+			dragAz = dragEl = spinAz = spinEl = 0;
+			fovIndex = 0;
+			targetFov = fovArray[0];
+			userZoomed = false;
 		}
 		function toggleRotation() { rotationEnabled = !rotationEnabled; }
 		function toggleWater() {
@@ -547,21 +576,79 @@
 			}
 		});
 
+		// passive parallax — the original's signature drift; suspended while the user drags
 		document.addEventListener('mousemove', (e) => {
+			if (isDragging) return;
 			mouseX = e.clientX - windowHalfX;
 			mouseY = e.clientY - windowHalfY;
 		});
-		renderer.domElement.addEventListener('touchmove', (e) => {
+
+		const canvas = renderer.domElement;
+
+		// drag to orbit (pointer events cover mouse, pen and single-finger touch)
+		canvas.addEventListener('pointerdown', (e) => {
+			if (e.pointerType === 'touch' && pinchDist > 0) return;
+			isDragging = true;
+			spinAz = spinEl = 0;
+			lastPtrX = e.clientX; lastPtrY = e.clientY;
+			canvas.setPointerCapture(e.pointerId);
+			canvas.classList.add('grabbing');
+		});
+		canvas.addEventListener('pointermove', (e) => {
+			if (!isDragging) return;
+			const dx = e.clientX - lastPtrX, dy = e.clientY - lastPtrY;
+			lastPtrX = e.clientX; lastPtrY = e.clientY;
+			// scale by fov so dragging stays proportional when zoomed in
+			const k = 0.004 * (camera.fov / fovArray[0]);
+			spinAz = dx * k;
+			spinEl = dy * k;
+			dragAz += spinAz;
+			dragEl = clamp(dragEl + spinEl, -EL_LIMIT, EL_LIMIT);
+		});
+		const endDrag = (e) => {
+			if (!isDragging) return;
+			isDragging = false;
+			if (e && canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+			canvas.classList.remove('grabbing');
+		};
+		canvas.addEventListener('pointerup', endDrag);
+		canvas.addEventListener('pointercancel', endDrag);
+
+		// wheel to zoom (exponential, so each notch feels the same at any zoom level)
+		canvas.addEventListener('wheel', (e) => {
 			e.preventDefault();
-			const t = e.touches[0];
-			mouseX = t.clientX - windowHalfX;
-			mouseY = t.clientY - windowHalfY;
+			const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? window.innerHeight : 1;
+			zoomBy(Math.exp(e.deltaY * unit * 0.0016));
 		}, { passive: false });
+
+		canvas.addEventListener('dblclick', resetView);
+
+		// two-finger pinch to zoom
+		canvas.addEventListener('touchstart', (e) => {
+			if (e.touches.length !== 2) return;
+			endDrag();
+			pinchDist = Math.hypot(
+				e.touches[0].clientX - e.touches[1].clientX,
+				e.touches[0].clientY - e.touches[1].clientY);
+		}, { passive: true });
+		canvas.addEventListener('touchmove', (e) => {
+			if (e.touches.length !== 2) return;
+			e.preventDefault();
+			const d2 = Math.hypot(
+				e.touches[0].clientX - e.touches[1].clientX,
+				e.touches[0].clientY - e.touches[1].clientY);
+			if (pinchDist > 0 && d2 > 0) zoomBy(pinchDist / d2);
+			pinchDist = d2;
+		}, { passive: false });
+		const endPinch = (e) => { if (e.touches.length < 2) pinchDist = 0; };
+		canvas.addEventListener('touchend', endPinch, { passive: true });
+		canvas.addEventListener('touchcancel', endPinch, { passive: true });
 
 		function onWindowResize() {
 			const W = window.innerWidth, H = window.innerHeight;
 			windowHalfX = W / 2; windowHalfY = H / 2;
-			if (isMobile) camera.fov = W > H ? 17.5 : 30;
+			// re-fit on orientation change, but never fight a zoom the user set by hand
+			if (isMobile && !userZoomed) targetFov = camera.fov = W > H ? 17.5 : 30;
 			camera.aspect = W / H;
 			camera.updateProjectionMatrix();
 			renderer.setPixelRatio(renderScale);
@@ -587,8 +674,26 @@
 			angle += 0.05 * (targetX - angle);
 			height += 0.05 * (targetY - height);
 
+			// inertia: keep coasting after the pointer is released
+			if (!isDragging && (spinAz || spinEl)) {
+				dragAz += spinAz;
+				dragEl = clamp(dragEl + spinEl, -EL_LIMIT, EL_LIMIT);
+				spinAz *= 0.93; spinEl *= 0.93;
+				if (Math.abs(spinAz) < 1e-5) spinAz = 0;
+				if (Math.abs(spinEl) < 1e-5) spinEl = 0;
+			}
+
+			// eased zoom
+			if (Math.abs(camera.fov - targetFov) > 1e-3) {
+				camera.fov += (targetFov - camera.fov) * 0.15;
+				camera.updateProjectionMatrix();
+			}
+
 			const d = 380, n = 0.075;
-			camera.position.set(-Math.sin(angle * n) * d, 15.5 * height, Math.cos(angle * n) * d);
+			const az = angle * n + dragAz;
+			const el = clamp(height * 0.0408 + dragEl, -1.4, 1.4);
+			const ce = Math.cos(el);
+			camera.position.set(-Math.sin(az) * ce * d, Math.sin(el) * d, Math.cos(az) * ce * d);
 			camera.lookAt(lookTarget);
 			camera.updateMatrixWorld();
 
@@ -619,8 +724,13 @@
 		// live tuning hooks
 		window.APP = {
 			THREE, renderer, camera, sun, hemi, earthMaterial, waterMaterial, meshRoot, waterMesh, render, setLOD, setScale, applyWaterPreset, waterPresets,
-			setMouse(x, y) { mouseX = x; mouseY = y; angle = x * 0.04; height = y * 0.04; },
+			zoomBy, resetView,
+			setMouse(x, y) {
+				mouseX = x; mouseY = y; angle = x * 0.04; height = y * 0.04;
+				dragAz = dragEl = spinAz = spinEl = 0;
+			},
 			setRotation(v, enabled) { meshRoot.rotation.y = v; if (enabled !== undefined) rotationEnabled = enabled; },
+			get view() { return { fov: camera.fov, targetFov, dragAz, dragEl, dragging: isDragging }; },
 			get loaded() { return loadingEl.style.display === 'none'; }
 		};
 	</script>
