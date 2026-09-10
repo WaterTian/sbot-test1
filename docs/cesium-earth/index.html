@@ -104,14 +104,16 @@
 		</div>
 
 		<div class="row btns">
-			<button id="btnSea" aria-pressed="false">海平面壳</button>
+			<button id="btnWater" aria-pressed="true">水色</button>
+			<button id="btnWaves" aria-pressed="true">波光</button>
 			<button id="btnLight" aria-pressed="true">日照</button>
 			<button id="btnHome">复位</button>
 		</div>
 
 		<div id="note">
-			高程与影像来自本项目 Three.js 版的同一批 NASA Blue Marble 贴图（4K），
-			经自定义地形源喂给 Cesium。<a href="../earth-bathymetry/">← 对比 Three.js 版</a>
+			高程与影像来自本项目 Three.js 版的同一批 NASA Blue Marble 贴图（4K）。
+			水色按 Three.js 版同一套吸收公式按水深烘进影像，波浪与日光反射用 Cesium 自带的海洋效果。
+			<a href="../earth-bathymetry/">← 对比 Three.js 版</a>
 		</div>
 	</div>
 
@@ -155,7 +157,8 @@
 			});
 		}
 
-		const hImg = await loadImage(HEIGHT_SRC);
+		loadingEl.textContent = '正在读取贴图…';
+		const [hImg, dImg] = await Promise.all([loadImage(HEIGHT_SRC), loadImage(IMAGERY_SRC)]);
 		const hcv = document.createElement('canvas');
 		hcv.width = hImg.width; hcv.height = hImg.height;
 		const hctx = hcv.getContext('2d', { willReadFrequently: true });
@@ -179,6 +182,141 @@
 			return top * (1 - fy) + bot * fy;
 		}
 
+		function grayAt(lon, lat) {
+			let u = (lon + 180) / 360;
+			u -= Math.floor(u);
+			const v = Math.min(Math.max((90 - lat) / 180, 0), 1);
+			return hpx[(Math.min(HH - 1, (v * HH) | 0) * HW + Math.min(HW - 1, (u * HW) | 0)) * 4];
+		}
+
+		// --------------------------------------------------------------
+		// 水色:把 Three.js 版的水下消光公式按「垂直水深」烘进海洋像素
+		// Three.js 版里地表半径 = 50 + 灰度/255×10,海面在 55.5,即海平面落在灰度 140.25。
+		// 光在水里按 R/G/B 各自衰减(红光最先被吸收,所以越深越蓝),水体本身再向外散射出
+		// 由浅青到深蓝的颜色。参数与 Three.js 版第一档水色一致。
+		// 与 Three.js 版的差别:那边厚度按视线穿过水体的实际路程算(贴近球边缘会更深),
+		// 这里只能按垂直水深算 —— 烘在贴图里的东西不知道你从哪个角度看。
+		const WATER = {
+			seaGray: 140.25,
+			unitScale: 12,
+			ext: [6, 30, 32],
+			visibility: 25,
+			fade: 0.8,
+			floorDim: 0.35,
+			sunlight: 2.0,           // Three.js 版里海底先被太阳照亮再进水,这里用常数近似
+			shallow: [0.10, 0.42, 0.46],
+			deep: [0.004, 0.020, 0.026],
+			exposure: 2.5
+		};
+
+		const srgbToLin = new Float32Array(256);
+		for (let i = 0; i < 256; i++) {
+			const c = i / 255;
+			srgbToLin[i] = c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+		}
+		const LIN_STEPS = 4096;
+		const linToSrgb = new Uint8Array(LIN_STEPS + 1);
+		for (let i = 0; i <= LIN_STEPS; i++) {
+			const c = i / LIN_STEPS;
+			const v = c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+			linToSrgb[i] = Math.round(Math.min(1, Math.max(0, v)) * 255);
+		}
+
+		// 水的效果只取决于该点的高程灰度,按 256 档预先算好
+		const wT = new Float32Array(256 * 3);     // 海底颜色的透射率
+		const wAdd = new Float32Array(256 * 3);   // 水体自身散射出来的颜色
+		const wMix = new Float32Array(256);       // 岸线过渡:1 = 全水,0 = 陆地
+		for (let g = 0; g < 256; g++) {
+			const th = Math.max(0, (WATER.seaGray - g) / 255 * 10) * WATER.unitScale;
+			const inscatter = 1 - Math.exp(-th / WATER.visibility);
+			const deepMix = 1 - Math.exp(-th * WATER.fade / WATER.visibility);
+			for (let c = 0; c < 3; c++) {
+				wT[g * 3 + c] = Math.exp(-th / WATER.ext[c]) * WATER.floorDim * WATER.sunlight;
+				wAdd[g * 3 + c] = (WATER.shallow[c] + (WATER.deep[c] - WATER.shallow[c]) * deepMix) * inscatter;
+			}
+			wMix[g] = Math.min(1, Math.max(0, (WATER.seaGray + 0.5 - g) / 2));
+		}
+
+		// 陆地调子:关掉地面大气后陆地偏暗(亚马孙实测只有 Three.js 版的约 0.4 倍亮度)。
+		// 按线性光提亮 2.6 倍,再用一段肩部把白色压回 1,雪和沙漠不会过曝发白
+		const LAND = { gain: 2.6 };
+		const landLUT = new Uint8Array(256);
+		{
+			const shoulder = (LAND.gain - 1) / LAND.gain;
+			for (let v = 0; v < 256; v++) {
+				const x = srgbToLin[v] * LAND.gain;
+				const y = x / (1 + x * shoulder);
+				landLUT[v] = linToSrgb[Math.min(LIN_STEPS, (y * LIN_STEPS) | 0)];
+			}
+		}
+
+		// 同时烘两层:raw = 只调亮(海底是灰白浮雕),water = 调亮的陆地 + 按水深算出来的海水
+		// raw 直接写回源缓冲,省下一整张 4K 的内存
+		function bakeLayers(src) {
+			const DW = src.width, DH = src.height, s = src.data;
+			const wat = new ImageData(DW, DH), w = wat.data;
+			const sx = HW / DW, sy = HH / DH, E = WATER.exposure;
+			for (let y = 0; y < DH; y++) {
+				const row = Math.min(HH - 1, (y * sy) | 0) * HW;
+				for (let x = 0; x < DW; x++) {
+					const g = hpx[(row + Math.min(HW - 1, (x * sx) | 0)) * 4];
+					const m = wMix[g];
+					const i = (y * DW + x) * 4;
+					for (let c = 0; c < 3; c++) {
+						const orig = s[i + c];
+						const toned = landLUT[orig];
+						if (m === 0) {
+							w[i + c] = toned;
+						} else {
+							let v = srgbToLin[orig] * wT[g * 3 + c] + wAdd[g * 3 + c];
+							v = (v * E) / (1 + v * E);                 // Reinhard,同 Three.js 版
+							w[i + c] = toned + (linToSrgb[(v * LIN_STEPS) | 0] - toned) * m;
+						}
+						s[i + c] = toned;
+					}
+					w[i + 3] = 255;
+				}
+			}
+			return wat;
+		}
+
+		loadingEl.textContent = '正在调水色…';
+		await new Promise((r) => setTimeout(r, 0));       // 先让提示画出来
+		const dcv = document.createElement('canvas');
+		dcv.width = dImg.width; dcv.height = dImg.height;
+		const dctx = dcv.getContext('2d', { willReadFrequently: true });
+		dctx.drawImage(dImg, 0, 0);
+		const dData = dctx.getImageData(0, 0, dcv.width, dcv.height);
+		const bakeStart = performance.now();
+		const wData = bakeLayers(dData);
+		const bakeMs = Math.round(performance.now() - bakeStart);
+		const toUrl = async (img) => {
+			dctx.putImageData(img, 0, 0);
+			return URL.createObjectURL(await new Promise((r) => dcv.toBlob(r, 'image/jpeg', 0.92)));
+		};
+		const RAW_SRC = await toUrl(dData);
+		const BAKED_SRC = await toUrl(wData);
+
+		// 水体掩膜:告诉 Cesium 哪里是海,它才会在那里跑自带的波浪法线与日光高光
+		const MASK = 256;
+		function waterMaskFor(rect) {
+			const m = new Uint8Array(MASK * MASK);
+			let any = false, all = true;
+			for (let j = 0; j < MASK; j++) {           // 第 0 行是北边,与 quantized-mesh 约定一致
+				const lat = Cesium.Math.toDegrees(Cesium.Math.lerp(rect.north, rect.south, (j + 0.5) / MASK));
+				for (let i = 0; i < MASK; i++) {
+					const lon = Cesium.Math.toDegrees(Cesium.Math.lerp(rect.west, rect.east, (i + 0.5) / MASK));
+					const v = (wMix[grayAt(lon, lat)] * 255) | 0;
+					m[j * MASK + i] = v;
+					if (v) any = true;
+					if (v !== 255) all = false;
+				}
+			}
+			if (!any) return new Uint8Array([0]);        // 整块是陆地
+			if (all) return new Uint8Array([255]);       // 整块是海
+			return m;
+		}
+
 		// --------------------------------------------------------------
 		// 自定义地形源:Cesium 按需要哪块就来问,我们现算现给
 
@@ -187,37 +325,51 @@
 		// 4K 源图到第 6 级就没有更多细节了,再往下细分只是徒增瓦片
 		const MAX_LEVEL = 6;
 
+		function heightsFor(rect) {
+			const out = new Float32Array(TILE * TILE);
+			for (let j = 0; j < TILE; j++) {
+				const lat = Cesium.Math.toDegrees(
+					Cesium.Math.lerp(rect.north, rect.south, j / (TILE - 1)));
+				for (let i = 0; i < TILE; i++) {
+					const lon = Cesium.Math.toDegrees(
+						Cesium.Math.lerp(rect.west, rect.east, i / (TILE - 1)));
+					out[j * TILE + i] = elevationAt(lon, lat);
+				}
+			}
+			return out;
+		}
+
 		const terrainProvider = new Cesium.CustomHeightmapTerrainProvider({
 			width: TILE,
 			height: TILE,
 			tilingScheme: tilingScheme,
-			callback: function (x, y, level) {
-				const rect = tilingScheme.tileXYToRectangle(x, y, level);
-				const out = new Float32Array(TILE * TILE);
-				for (let j = 0; j < TILE; j++) {
-					const lat = Cesium.Math.toDegrees(
-						Cesium.Math.lerp(rect.north, rect.south, j / (TILE - 1)));
-					for (let i = 0; i < TILE; i++) {
-						const lon = Cesium.Math.toDegrees(
-							Cesium.Math.lerp(rect.west, rect.east, i / (TILE - 1)));
-						out[j * TILE + i] = elevationAt(lon, lat);
-					}
-				}
-				return out;
-			}
+			callback: (x, y, level) => heightsFor(tilingScheme.tileXYToRectangle(x, y, level))
 		});
+		// CustomHeightmapTerrainProvider 自己不带水体掩膜。接管取瓦片这一步,把掩膜一起塞进去
+		terrainProvider.requestTileGeometry = function (x, y, level) {
+			const rect = tilingScheme.tileXYToRectangle(x, y, level);
+			return Promise.resolve(new Cesium.HeightmapTerrainData({
+				buffer: heightsFor(rect),
+				width: TILE,
+				height: TILE,
+				waterMask: waterMaskFor(rect)
+			}));
+		};
+		Object.defineProperty(terrainProvider, 'hasWaterMask', { get: () => true });
 
 		// --------------------------------------------------------------
 		// 影像:同一批贴图铺满整球,全程不碰 Cesium ion(无 token、可离线)
 
-		const imagery = await Cesium.SingleTileImageryProvider.fromUrl(IMAGERY_SRC, {
+		const imageryOpts = {
 			rectangle: Cesium.Rectangle.MAX_VALUE,
-			tileWidth: 4096,
-			tileHeight: 2048
-		});
+			tileWidth: dImg.width,
+			tileHeight: dImg.height
+		};
+		const rawImagery = await Cesium.SingleTileImageryProvider.fromUrl(RAW_SRC, imageryOpts);
+		const bakedImagery = await Cesium.SingleTileImageryProvider.fromUrl(BAKED_SRC, imageryOpts);
 
 		const viewer = new Cesium.Viewer('globe', {
-			baseLayer: new Cesium.ImageryLayer(imagery),
+			baseLayer: new Cesium.ImageryLayer(rawImagery),
 			terrainProvider: terrainProvider,
 			// 下面这些控件要么依赖 ion,要么对这个演示没用
 			geocoder: false, baseLayerPicker: false, sceneModePicker: false,
@@ -237,26 +389,19 @@
 		// 否则默认打开就是一片夜面 —— 这是它「按真实天文算」的代价。
 		viewer.clock.currentTime = Cesium.JulianDate.fromIso8601('2026-09-10T15:00:00Z');
 		viewer.clock.shouldAnimate = false;
-		scene.light.intensity = 3.0;
-		globe.lambertDiffuseMultiplier = 1.4;
 		globe.baseColor = Cesium.Color.fromCssColorString('#0B0E14');
+		// 球外那圈天空光晕保留;地面大气关掉 —— 它给整个球面罩一层偏青的雾,
+		// 实测把深海从 (69,137,143) 抬到 (119,182,196),水色全被冲淡
 		scene.skyAtmosphere.show = true;
-		scene.globe.showGroundAtmosphere = true;
+		globe.showGroundAtmosphere = false;
 		scene.screenSpaceCameraController.minimumZoomDistance = 200000;
 
-		// 海平面:一层半透明椭球壳。默认关着 —— 它会把整个球连同陆地一起蒙上一层,
-		// 这正是 Cesium 不自带「水下消光」的证据:要做成 Three.js 那版的效果,
-		// 得自己写后处理去拿深度图,而不是糊一层壳。
-		const R = Cesium.Ellipsoid.WGS84.radii;
-		const sea = viewer.entities.add({
-			show: false,
-			position: Cesium.Cartesian3.ZERO,
-			ellipsoid: {
-				radii: new Cesium.Cartesian3(R.x, R.y, R.z),
-				material: Cesium.Color.fromCssColorString('#0E5A6E').withAlpha(0.4),
-				outline: false
-			}
-		});
+		// 烘好水色的那层叠在原始影像上面,开关它就能对比「有水 / 只有海底浮雕」
+		const waterLayer = viewer.imageryLayers.addImageryProvider(bakedImagery);
+
+		// Cesium 自带的海洋效果:按水体掩膜在海面跑动态波浪法线和太阳高光
+		globe.showWaterEffect = true;
+		globe.zoomedOutOceanSpecularIntensity = 0.45;
 
 		const HOME = Cesium.Cartesian3.fromDegrees(-40, 10, 24000000);
 		function goHome() {
@@ -274,19 +419,17 @@
 			exagVal.textContent = exag.value + '×';
 		});
 
-		const btnSea = document.getElementById('btnSea');
-		btnSea.addEventListener('click', () => {
-			const on = btnSea.getAttribute('aria-pressed') !== 'true';
-			btnSea.setAttribute('aria-pressed', String(on));
-			sea.show = on;
-		});
-
-		const btnLight = document.getElementById('btnLight');
-		btnLight.addEventListener('click', () => {
-			const on = btnLight.getAttribute('aria-pressed') !== 'true';
-			btnLight.setAttribute('aria-pressed', String(on));
-			globe.enableLighting = on;
-		});
+		function toggle(id, apply) {
+			const btn = document.getElementById(id);
+			btn.addEventListener('click', () => {
+				const on = btn.getAttribute('aria-pressed') !== 'true';
+				btn.setAttribute('aria-pressed', String(on));
+				apply(on);
+			});
+		}
+		toggle('btnWater', (on) => { waterLayer.show = on; });
+		toggle('btnWaves', (on) => { globe.showWaterEffect = on; });
+		toggle('btnLight', (on) => { globe.enableLighting = on; });
 
 		document.getElementById('btnHome').addEventListener('click', goHome);
 
@@ -309,18 +452,19 @@
 
 		// --------------------------------------------------------------
 
-		await viewer.scene.globe.tileLoadProgressEvent.raiseEvent;
 		loadingEl.remove();
 		panelEl.hidden = false;
 		statusEl.hidden = false;
 
 		window.APP = {
-			Cesium, viewer, scene, elevationAt, decode, goHome,
+			Cesium, viewer, scene, elevationAt, decode, goHome, waterLayer, WATER, LAND,
 			get info() {
 				return {
 					exaggeration: scene.verticalExaggeration,
 					lighting: globe.enableLighting,
-					sea: sea.show,
+					water: waterLayer.show,
+					waves: globe.showWaterEffect,
+					bakeMs: bakeMs,
 					tilesLoaded: globe.tilesLoaded,
 					// 实测有没有真的打到 ion 的服务器(库里带着默认 token,光看 token 说明不了问题)
 					ionRequests: performance.getEntriesByType('resource')

@@ -20,7 +20,6 @@ accepted:
   radius|999px: 实际写法是状态点/声呐环/项目符号的 border-radius:50%。圆点是指示符不是容器，6px / 10px 两档管的是卡片与控件转角。
   font|ibm plex sans: 风格档「本项目落地范围」已定「字体使用系统回退，无远程字体依赖」，栈里排在后面的是苹方 / 微软雅黑。
   font|ibm plex mono: 同上。大会现场那台电脑很可能没有网，远程字体一断整套版式就塌，宁可用 ui-monospace 兜底；数值仍走等宽族，这条要求没丢。
-  color|#0E5A6E: cesium-earth 的半透明海平面壳颜色,是三维场景里的水体本身,不是界面用色;且默认关闭,只作为「Cesium 不自带水下消光」的演示开关。
   color|#000000: earth-bathymetry 复刻页的 body 底色与原站一致(纯黑太空底),复刻目标是「像原站」而不是套项目档;WebGL 画布本身 clearColor 是 #020202。
   color|#00AAFF: earth-bathymetry 复刻页右上角「Loading ...」角标,原站同款天蓝,加载完即消失,不进正式画面。
   color|#AAAAAA: earth-bathymetry 复刻页「不支持 WebGL2」兜底提示文字色,只在无 WebGL2 的浏览器里出现。
@@ -77,9 +76,6 @@ accepted:
 
 ## docs/cesium-earth(CesiumJS 对照实现,2026-09-10)
 
-- **颜色 #0E5A6E** — 半透明海平面壳的水体颜色。这是三维场景内容(和影像贴图同类),不是界面用色,
-  色板管的是面板/按钮/文字那一层。而且它默认是关闭的,只用来演示「Cesium 不自带水下消光效果」
-  这件事:一层均匀的壳会把陆地一起蒙住,想要 Three.js 那版的效果必须自己写后处理。
 - **IBM Plex Sans / IBM Plex Mono 找不到加载来源** — 与项目既有判定一致:字体走系统回退、
   不引入远程字体依赖,栈里排在后面的是苹方 / 思源 / 微软雅黑与 ui-monospace。
   (本次工具没有把这两条折叠进已接受清单,判据同上。)
