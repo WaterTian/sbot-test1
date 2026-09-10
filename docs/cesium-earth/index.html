@@ -104,7 +104,7 @@
 		</div>
 
 		<div class="row btns">
-			<button id="btnWater" aria-pressed="true">水色</button>
+			<button id="btnWater" aria-pressed="true">水体</button>
 			<button id="btnWaves" aria-pressed="true">波光</button>
 			<button id="btnLight" aria-pressed="true">日照</button>
 			<button id="btnHome">复位</button>
@@ -112,7 +112,8 @@
 
 		<div id="note">
 			高程与影像来自本项目 Three.js 版的同一批 NASA Blue Marble 贴图（4K）。
-			水色按 Three.js 版同一套吸收公式按水深烘进影像，波浪与日光反射用 Cesium 自带的海洋效果。
+			水体用的是 Three.js 版那套着色器，移植成 Cesium 的后处理：按视线穿过海水的实际路程分通道吸收，
+			加上折射、波浪与日光高光。
 			<a href="../earth-bathymetry/">← 对比 Three.js 版</a>
 		</div>
 	</div>
@@ -121,6 +122,167 @@
 	<div id="loading">正在装配地形…</div>
 
 	<script>
+	// ------------------------------------------------------------------
+	// 水体着色器 —— earth-bathymetry(Three.js 版)那套水面着色器的 Cesium 移植。
+	// Three.js 版是把水球单独画一遍、读地形那一遍的深度;Cesium 里没有「另画一个水球」
+	// 这一层,所以改成全屏后处理:每个像素自己算视线打到海平面椭球的位置,再和深度缓冲里
+	// 地形的距离相减,得到视线在水里走了多远。其余(分通道吸收、浅→深水色、折射、
+	// 两层滚动的法线贴图、日光高光、菲涅尔)与 Three.js 版逐项对应。
+	const WATER_FS = `
+		uniform sampler2D colorTexture;
+		uniform sampler2D depthTexture;
+		uniform sampler2D normalMap;
+		uniform float time;
+		uniform float exaggeration;
+		uniform float lightOn;
+		uniform float wavesOn;
+		uniform vec3 radiiScale;       // R0 / 椭球三轴半径
+		uniform float R0;
+		uniform vec3 extinction;
+		uniform float visibility;
+		uniform float fadeSpeed;
+		uniform float floorDim;
+		uniform vec3 shallowColor;
+		uniform vec3 deepColor;
+		uniform float exposure;
+		uniform float depthK;
+		uniform float depthPow;
+		uniform float refractionScale;
+		uniform float normalScale;
+		uniform float specular;
+		uniform float shininess;
+		uniform float fresnelScale;
+		uniform float shoreWidth;      // 世界米(已夸张)
+		uniform float rimCap;          // 真实米
+		uniform float debugMode;
+		in vec2 v_textureCoordinates;
+
+		vec3 toLin(vec3 c) { return pow(max(c, vec3(0.0)), vec3(2.2)); }
+		vec3 toSrgb(vec3 c) { return pow(max(c, vec3(0.0)), vec3(1.0 / 2.2)); }
+
+		vec3 viewDirEC(vec2 uv) {
+			vec4 e = czm_inverseProjection * vec4(uv * 2.0 - 1.0, 0.0, 1.0);
+			return normalize(e.xyz / e.w);
+		}
+
+		// 沿视线到深度缓冲里那个东西的距离。直接解对数深度 —— 反解成 0..1 的窗口深度
+		// 在行星尺度上会全挤在 1 附近,float 精度撑不住
+		float geomDistance(vec2 uv, vec3 dirEC, out bool hit) {
+			float logZ = texture(depthTexture, uv).r;
+			hit = logZ < 0.999999;
+			float zEye = pow(2.0, logZ * czm_log2FarDepthFromNearPlusOne) - 1.0 + czm_currentFrustum.x;
+			return zEye / max(-dirEC.z, 1e-4);
+		}
+
+		// 视线与海平面椭球求交。先按三轴缩放成单位球,再以「地球半径」为单位解,float 才够用
+		bool seaHit(vec3 dirWC, out float tNear, out float tFar) {
+			vec3 o = czm_viewerPositionWC / R0 * radiiScale;
+			vec3 d = dirWC * radiiScale;
+			float a = dot(d, d);
+			float b = 2.0 * dot(o, d);
+			float c = dot(o, o) - 1.0;
+			float disc = b * b - 4.0 * a * c;
+			if (disc < 0.0) return false;
+			float s = sqrt(disc);
+			tNear = (-b - s) / (2.0 * a) * R0;
+			tFar = (-b + s) / (2.0 * a) * R0;
+			return tNear > 0.0;
+		}
+
+		// 某个世界坐标点在海平面以下的垂直深度(换算回真实米)
+		float depthBelowSea(vec3 pWC) {
+			float r = length(pWC / R0 * radiiScale);
+			return max((1.0 - r) * R0 / exaggeration, 0.0);
+		}
+
+		void main(void) {
+			vec2 uv = v_textureCoordinates;
+			vec4 src = texture(colorTexture, uv);
+
+			vec3 dirEC = viewDirEC(uv);
+			vec3 dirWC = normalize(czm_inverseViewRotation * dirEC);
+
+			float tN, tF;
+			if (!seaHit(dirWC, tN, tF)) { out_FragColor = src; return; }
+
+			bool hit0;
+			float g0 = geomDistance(uv, dirEC, hit0);
+			// 地形在海面前面 = 陆地;在后面 = 海底
+			float land = hit0 ? 1.0 - smoothstep(-shoreWidth, shoreWidth, g0 - tN) : 0.0;
+			if (land > 0.999) { out_FragColor = src; return; }
+
+			vec3 p = czm_viewerPositionWC + dirWC * tN;
+			vec3 n = normalize(p * radiiScale * radiiScale);          // 大地法线 ∝ p / 半径²
+			vec3 east = normalize(vec3(-n.y, n.x, 0.0) + vec3(1e-6, 0.0, 0.0));
+			vec3 north = cross(n, east);
+			vec3 L = normalize(czm_lightDirectionWC);
+			vec3 V = -dirWC;
+
+			// 波浪:同一张法线贴图两层反向滚动,UV 按经纬度铺,与 Three.js 版球面 UV 一致
+			float lon = atan(p.y, p.x);
+			float lat = asin(clamp(n.z, -1.0, 1.0));
+			vec2 suv = vec2(lon / czm_twoPi + 0.5, lat / czm_pi + 0.5);
+			vec2 uv1 = suv * vec2(4.0, 2.0) + vec2(time * 0.010, time * 0.006);
+			vec2 uv2 = suv * vec2(4.0, 2.0) * 1.83 + vec2(-time * 0.008, time * 0.011);
+			vec3 n1 = texture(normalMap, fract(uv1)).xyz * 2.0 - 1.0;
+			vec3 n2 = texture(normalMap, fract(uv2)).xyz * 2.0 - 1.0;
+			vec3 nt = normalize(vec3((n1.xy + n2.xy) * 0.5 * normalScale * wavesOn, 1.0));
+			vec3 N = normalize(east * nt.x + north * nt.y + n * nt.z);
+
+			// 折射:按波浪法线在屏幕上偏一点去取海底。偏过去的那个像素要用它自己那条视线的
+			// 海面距离来算水深 —— 拿本像素的海面距离去减,越靠边缘两者差得越多,水会平白变厚
+			vec3 NEC = czm_viewRotation * N;
+			vec2 ruv = uv + NEC.xy * refractionScale * wavesOn;
+			vec3 dirR = viewDirEC(ruv);
+			vec3 dirRWC = normalize(czm_inverseViewRotation * dirR);
+			bool hitR;
+			float gR = geomDistance(ruv, dirR, hitR);
+			float tNR, tFR;
+			bool seaR = seaHit(dirRWC, tNR, tFR);
+			vec3 floorCol = toLin(texture(colorTexture, ruv).rgb);
+			float gUse = gR, tUse = tNR;
+			bool hitUse = hitR;
+			vec3 dUse = dirRWC;
+			if (!hitR || !seaR || gR < tNR) { floorCol = toLin(src.rgb); gUse = g0; tUse = tN; hitUse = hit0; dUse = dirWC; }
+
+			// 光在水里走的路程(真实米)。深度这条轴沿用 Three.js 版的「不按比例」观感:
+			// 垂直方向按水深的幂次压缩(浅滩也能看出颜色),斜着看时路程照实拉长,边缘因此变深
+			float path;
+			float th;
+			if (!hitUse) {
+				path = min((tF - tN) / exaggeration, rimCap);
+				th = depthK * path * pow(4000.0, depthPow - 1.0);
+				floorCol = vec3(0.0);
+			} else {
+				path = max(gUse - tUse, 0.0) / exaggeration;
+				float vd = max(depthBelowSea(czm_viewerPositionWC + dUse * gUse), 30.0);
+				th = depthK * path * pow(vd, depthPow - 1.0);
+			}
+
+			if (debugMode > 0.5) { out_FragColor = vec4(vec3(path / 10000.0), 1.0); return; }
+
+			vec3 T = exp(-th / extinction);
+			float inscatter = 1.0 - exp(-th / visibility);
+			float deepMix = 1.0 - exp(-th * fadeSpeed / visibility);
+			vec3 waterCol = mix(shallowColor, deepColor, deepMix);
+
+			// Three.js 版的光总从正面来;这里有真实晨昏线,水体散射也得跟着日照走
+			float ndl = dot(n, L);
+			float lit = mix(1.0, 0.12 + 0.88 * smoothstep(-0.15, 0.3, ndl), lightOn);
+			vec3 col = floorCol * floorDim * T + waterCol * inscatter * lit;
+
+			vec3 H = normalize(L + V);
+			float spec = pow(max(dot(N, H), 0.0), shininess);
+			float fres = pow(1.0 - max(dot(n, V), 0.0), 5.0);
+			float sunSide = mix(1.0, smoothstep(-0.1, 0.25, ndl), lightOn);
+			col += vec3(specular) * spec * sunSide * wavesOn;
+			col += vec3(0.85, 0.9, 0.95) * fres * fresnelScale * lit;
+
+			col = col * exposure / (1.0 + col * exposure);           // Reinhard,同 Three.js 版
+			out_FragColor = vec4(mix(toSrgb(col), src.rgb, land), 1.0);
+		}
+	`;
+
 	(async function () {
 		const loadingEl = document.getElementById('loading');
 		const panelEl = document.getElementById('panel');
@@ -129,6 +291,7 @@
 		const TEX = '../earth-bathymetry/textures/';
 		const HEIGHT_SRC = TEX + 'bathymetry_bw_composite_4k.jpg';
 		const IMAGERY_SRC = TEX + 'bathymetry_diffuse_4k.jpg';
+		const NORMAL_SRC = TEX + 'water-normal.jpg';
 
 		// --------------------------------------------------------------
 		// 高程解码
@@ -145,9 +308,6 @@
 			return 0;             // 海岸带
 		}
 
-		// --------------------------------------------------------------
-		// 把高程图读进像素缓冲
-
 		function loadImage(src) {
 			return new Promise((res, rej) => {
 				const im = new Image();
@@ -159,6 +319,7 @@
 
 		loadingEl.textContent = '正在读取贴图…';
 		const [hImg, dImg] = await Promise.all([loadImage(HEIGHT_SRC), loadImage(IMAGERY_SRC)]);
+
 		const hcv = document.createElement('canvas');
 		hcv.width = hImg.width; hcv.height = hImg.height;
 		const hctx = hcv.getContext('2d', { willReadFrequently: true });
@@ -182,32 +343,10 @@
 			return top * (1 - fy) + bot * fy;
 		}
 
-		function grayAt(lon, lat) {
-			let u = (lon + 180) / 360;
-			u -= Math.floor(u);
-			const v = Math.min(Math.max((90 - lat) / 180, 0), 1);
-			return hpx[(Math.min(HH - 1, (v * HH) | 0) * HW + Math.min(HW - 1, (u * HW) | 0)) * 4];
-		}
-
 		// --------------------------------------------------------------
-		// 水色:把 Three.js 版的水下消光公式按「垂直水深」烘进海洋像素
-		// Three.js 版里地表半径 = 50 + 灰度/255×10,海面在 55.5,即海平面落在灰度 140.25。
-		// 光在水里按 R/G/B 各自衰减(红光最先被吸收,所以越深越蓝),水体本身再向外散射出
-		// 由浅青到深蓝的颜色。参数与 Three.js 版第一档水色一致。
-		// 与 Three.js 版的差别:那边厚度按视线穿过水体的实际路程算(贴近球边缘会更深),
-		// 这里只能按垂直水深算 —— 烘在贴图里的东西不知道你从哪个角度看。
-		const WATER = {
-			seaGray: 140.25,
-			unitScale: 12,
-			ext: [6, 30, 32],
-			visibility: 25,
-			fade: 0.8,
-			floorDim: 0.35,
-			sunlight: 2.0,           // Three.js 版里海底先被太阳照亮再进水,这里用常数近似
-			shallow: [0.10, 0.42, 0.46],
-			deep: [0.004, 0.020, 0.026],
-			exposure: 2.5
-		};
+		// 影像调子:关掉地面大气后陆地偏暗(亚马孙实测只有 Three.js 版的约 0.4 倍亮度)。
+		// 按线性光提亮 2.6 倍,再用一段肩部把白色压回 1,雪和沙漠不会过曝发白。
+		// 海底浮雕一起提亮 —— 水体着色器拿它当海底颜色,正对应 Three.js 版里被照亮的海床
 
 		const srgbToLin = new Float32Array(256);
 		for (let i = 0; i < 256; i++) {
@@ -222,100 +361,34 @@
 			linToSrgb[i] = Math.round(Math.min(1, Math.max(0, v)) * 255);
 		}
 
-		// 水的效果只取决于该点的高程灰度,按 256 档预先算好
-		const wT = new Float32Array(256 * 3);     // 海底颜色的透射率
-		const wAdd = new Float32Array(256 * 3);   // 水体自身散射出来的颜色
-		const wMix = new Float32Array(256);       // 岸线过渡:1 = 全水,0 = 陆地
-		for (let g = 0; g < 256; g++) {
-			const th = Math.max(0, (WATER.seaGray - g) / 255 * 10) * WATER.unitScale;
-			const inscatter = 1 - Math.exp(-th / WATER.visibility);
-			const deepMix = 1 - Math.exp(-th * WATER.fade / WATER.visibility);
-			for (let c = 0; c < 3; c++) {
-				wT[g * 3 + c] = Math.exp(-th / WATER.ext[c]) * WATER.floorDim * WATER.sunlight;
-				wAdd[g * 3 + c] = (WATER.shallow[c] + (WATER.deep[c] - WATER.shallow[c]) * deepMix) * inscatter;
-			}
-			wMix[g] = Math.min(1, Math.max(0, (WATER.seaGray + 0.5 - g) / 2));
-		}
-
-		// 陆地调子:关掉地面大气后陆地偏暗(亚马孙实测只有 Three.js 版的约 0.4 倍亮度)。
-		// 按线性光提亮 2.6 倍,再用一段肩部把白色压回 1,雪和沙漠不会过曝发白
 		const LAND = { gain: 2.6 };
-		const landLUT = new Uint8Array(256);
+		const toneLUT = new Uint8Array(256);
 		{
 			const shoulder = (LAND.gain - 1) / LAND.gain;
 			for (let v = 0; v < 256; v++) {
 				const x = srgbToLin[v] * LAND.gain;
 				const y = x / (1 + x * shoulder);
-				landLUT[v] = linToSrgb[Math.min(LIN_STEPS, (y * LIN_STEPS) | 0)];
+				toneLUT[v] = linToSrgb[Math.min(LIN_STEPS, (y * LIN_STEPS) | 0)];
 			}
 		}
 
-		// 同时烘两层:raw = 只调亮(海底是灰白浮雕),water = 调亮的陆地 + 按水深算出来的海水
-		// raw 直接写回源缓冲,省下一整张 4K 的内存
-		function bakeLayers(src) {
-			const DW = src.width, DH = src.height, s = src.data;
-			const wat = new ImageData(DW, DH), w = wat.data;
-			const sx = HW / DW, sy = HH / DH, E = WATER.exposure;
-			for (let y = 0; y < DH; y++) {
-				const row = Math.min(HH - 1, (y * sy) | 0) * HW;
-				for (let x = 0; x < DW; x++) {
-					const g = hpx[(row + Math.min(HW - 1, (x * sx) | 0)) * 4];
-					const m = wMix[g];
-					const i = (y * DW + x) * 4;
-					for (let c = 0; c < 3; c++) {
-						const orig = s[i + c];
-						const toned = landLUT[orig];
-						if (m === 0) {
-							w[i + c] = toned;
-						} else {
-							let v = srgbToLin[orig] * wT[g * 3 + c] + wAdd[g * 3 + c];
-							v = (v * E) / (1 + v * E);                 // Reinhard,同 Three.js 版
-							w[i + c] = toned + (linToSrgb[(v * LIN_STEPS) | 0] - toned) * m;
-						}
-						s[i + c] = toned;
-					}
-					w[i + 3] = 255;
-				}
-			}
-			return wat;
-		}
-
-		loadingEl.textContent = '正在调水色…';
+		loadingEl.textContent = '正在调影像…';
 		await new Promise((r) => setTimeout(r, 0));       // 先让提示画出来
 		const dcv = document.createElement('canvas');
 		dcv.width = dImg.width; dcv.height = dImg.height;
 		const dctx = dcv.getContext('2d', { willReadFrequently: true });
 		dctx.drawImage(dImg, 0, 0);
 		const dData = dctx.getImageData(0, 0, dcv.width, dcv.height);
-		const bakeStart = performance.now();
-		const wData = bakeLayers(dData);
-		const bakeMs = Math.round(performance.now() - bakeStart);
-		const toUrl = async (img) => {
-			dctx.putImageData(img, 0, 0);
-			return URL.createObjectURL(await new Promise((r) => dcv.toBlob(r, 'image/jpeg', 0.92)));
-		};
-		const RAW_SRC = await toUrl(dData);
-		const BAKED_SRC = await toUrl(wData);
-
-		// 水体掩膜:告诉 Cesium 哪里是海,它才会在那里跑自带的波浪法线与日光高光
-		const MASK = 256;
-		function waterMaskFor(rect) {
-			const m = new Uint8Array(MASK * MASK);
-			let any = false, all = true;
-			for (let j = 0; j < MASK; j++) {           // 第 0 行是北边,与 quantized-mesh 约定一致
-				const lat = Cesium.Math.toDegrees(Cesium.Math.lerp(rect.north, rect.south, (j + 0.5) / MASK));
-				for (let i = 0; i < MASK; i++) {
-					const lon = Cesium.Math.toDegrees(Cesium.Math.lerp(rect.west, rect.east, (i + 0.5) / MASK));
-					const v = (wMix[grayAt(lon, lat)] * 255) | 0;
-					m[j * MASK + i] = v;
-					if (v) any = true;
-					if (v !== 255) all = false;
-				}
+		const toneStart = performance.now();
+		{
+			const s = dData.data;
+			for (let i = 0; i < s.length; i += 4) {
+				s[i] = toneLUT[s[i]]; s[i + 1] = toneLUT[s[i + 1]]; s[i + 2] = toneLUT[s[i + 2]];
 			}
-			if (!any) return new Uint8Array([0]);        // 整块是陆地
-			if (all) return new Uint8Array([255]);       // 整块是海
-			return m;
 		}
+		const toneMs = Math.round(performance.now() - toneStart);
+		dctx.putImageData(dData, 0, 0);
+		const TONED_SRC = URL.createObjectURL(await new Promise((r) => dcv.toBlob(r, 'image/jpeg', 0.92)));
 
 		// --------------------------------------------------------------
 		// 自定义地形源:Cesium 按需要哪块就来问,我们现算现给
@@ -345,31 +418,18 @@
 			tilingScheme: tilingScheme,
 			callback: (x, y, level) => heightsFor(tilingScheme.tileXYToRectangle(x, y, level))
 		});
-		// CustomHeightmapTerrainProvider 自己不带水体掩膜。接管取瓦片这一步,把掩膜一起塞进去
-		terrainProvider.requestTileGeometry = function (x, y, level) {
-			const rect = tilingScheme.tileXYToRectangle(x, y, level);
-			return Promise.resolve(new Cesium.HeightmapTerrainData({
-				buffer: heightsFor(rect),
-				width: TILE,
-				height: TILE,
-				waterMask: waterMaskFor(rect)
-			}));
-		};
-		Object.defineProperty(terrainProvider, 'hasWaterMask', { get: () => true });
 
 		// --------------------------------------------------------------
 		// 影像:同一批贴图铺满整球,全程不碰 Cesium ion(无 token、可离线)
 
-		const imageryOpts = {
+		const imagery = await Cesium.SingleTileImageryProvider.fromUrl(TONED_SRC, {
 			rectangle: Cesium.Rectangle.MAX_VALUE,
 			tileWidth: dImg.width,
 			tileHeight: dImg.height
-		};
-		const rawImagery = await Cesium.SingleTileImageryProvider.fromUrl(RAW_SRC, imageryOpts);
-		const bakedImagery = await Cesium.SingleTileImageryProvider.fromUrl(BAKED_SRC, imageryOpts);
+		});
 
 		const viewer = new Cesium.Viewer('globe', {
-			baseLayer: new Cesium.ImageryLayer(rawImagery),
+			baseLayer: new Cesium.ImageryLayer(imagery),
 			terrainProvider: terrainProvider,
 			// 下面这些控件要么依赖 ion,要么对这个演示没用
 			geocoder: false, baseLayerPicker: false, sceneModePicker: false,
@@ -390,18 +450,73 @@
 		viewer.clock.currentTime = Cesium.JulianDate.fromIso8601('2026-09-10T15:00:00Z');
 		viewer.clock.shouldAnimate = false;
 		globe.baseColor = Cesium.Color.fromCssColorString('#0B0E14');
-		// 球外那圈天空光晕保留;地面大气关掉 —— 它给整个球面罩一层偏青的雾,
-		// 实测把深海从 (69,137,143) 抬到 (119,182,196),水色全被冲淡
+		// 球外那圈天空光晕保留;地面大气关掉 —— 它给整个球面罩一层偏青的雾,水色会被冲淡
 		scene.skyAtmosphere.show = true;
 		globe.showGroundAtmosphere = false;
+		// 水交给下面的着色器,Cesium 自带的海面效果关掉免得叠两层
+		globe.showWaterEffect = false;
+		// 默认情况下 Cesium 画完地球就把地形深度丢掉,只留一块「地平线深度板」挡住地球背面的东西,
+		// 后处理拿到的深度因此全是那块板(实测整个球面都解出 24,836 km,正好是地平线圆所在的平面)。
+		// 打开对地形的深度测试,地形深度才会留在深度缓冲里,水体着色器才量得出水有多厚
+		globe.depthTestAgainstTerrain = true;
 		scene.screenSpaceCameraController.minimumZoomDistance = 200000;
 
-		// 烘好水色的那层叠在原始影像上面,开关它就能对比「有水 / 只有海底浮雕」
-		const waterLayer = viewer.imageryLayers.addImageryProvider(bakedImagery);
+		// --------------------------------------------------------------
+		// 水体后处理。参数取自 Three.js 版第一档水色;深度那条轴见着色器里的注释
 
-		// Cesium 自带的海洋效果:按水体掩膜在海面跑动态波浪法线和太阳高光
-		globe.showWaterEffect = true;
-		globe.zoomedOutOceanSpecularIntensity = 0.45;
+		const R0 = Cesium.Ellipsoid.WGS84.maximumRadius;
+		const radii = Cesium.Ellipsoid.WGS84.radii;
+		const WATER = {
+			extinction: new Cesium.Cartesian3(6, 30, 32),
+			visibility: 25,
+			fadeSpeed: 0.8,
+			floorDim: 0.35,
+			shallowColor: new Cesium.Cartesian3(0.10, 0.42, 0.46),
+			deepColor: new Cesium.Cartesian3(0.004, 0.020, 0.026),
+			exposure: 2.5,
+			depthK: 0.252,        // 4000 米深 → Three.js 版里同一处的光学厚度 36
+			depthPow: 0.6,        // 200 米浅滩 → 光学厚度 6,与 Three.js 版浅滩一致
+			refractionScale: 0.0275,
+			normalScale: 2.0,
+			specular: 0.12,
+			shininess: 160,
+			fresnelScale: 0.05,
+			rimCap: 13600,        // 球边缘只穿过水、没碰到海底的视线,路程封顶(真实米)
+			debug: 0
+		};
+		let wavesOn = true;
+
+		const waterStage = scene.postProcessStages.add(new Cesium.PostProcessStage({
+			name: 'bathymetryWater',
+			fragmentShader: WATER_FS,
+			uniforms: {
+				normalMap: NORMAL_SRC,
+				time: () => performance.now() / 1000,
+				exaggeration: () => Math.max(scene.verticalExaggeration, 0.001),
+				lightOn: () => (globe.enableLighting ? 1 : 0),
+				wavesOn: () => (wavesOn ? 1 : 0),
+				radiiScale: new Cesium.Cartesian3(R0 / radii.x, R0 / radii.y, R0 / radii.z),
+				R0: R0,
+				extinction: () => WATER.extinction,
+				visibility: () => WATER.visibility,
+				fadeSpeed: () => WATER.fadeSpeed,
+				floorDim: () => WATER.floorDim,
+				shallowColor: () => WATER.shallowColor,
+				deepColor: () => WATER.deepColor,
+				exposure: () => WATER.exposure,
+				depthK: () => WATER.depthK,
+				depthPow: () => WATER.depthPow,
+				refractionScale: () => WATER.refractionScale,
+				normalScale: () => WATER.normalScale,
+				specular: () => WATER.specular,
+				shininess: () => WATER.shininess,
+				fresnelScale: () => WATER.fresnelScale,
+				// 岸线过渡带随夸张倍数缩放:夸张越大,海床离海面越远,过渡带也可以越宽
+				shoreWidth: () => Math.max(30 * scene.verticalExaggeration, 60),
+				rimCap: () => WATER.rimCap,
+				debugMode: () => WATER.debug
+			}
+		}));
 
 		const HOME = Cesium.Cartesian3.fromDegrees(-40, 10, 24000000);
 		function goHome() {
@@ -427,10 +542,9 @@
 				apply(on);
 			});
 		}
-		toggle('btnWater', (on) => { waterLayer.show = on; });
-		toggle('btnWaves', (on) => { globe.showWaterEffect = on; });
+		toggle('btnWater', (on) => { waterStage.enabled = on; });
+		toggle('btnWaves', (on) => { wavesOn = on; });
 		toggle('btnLight', (on) => { globe.enableLighting = on; });
-
 		document.getElementById('btnHome').addEventListener('click', goHome);
 
 		// --------------------------------------------------------------
@@ -457,14 +571,16 @@
 		statusEl.hidden = false;
 
 		window.APP = {
-			Cesium, viewer, scene, elevationAt, decode, goHome, waterLayer, WATER, LAND,
+			Cesium, viewer, scene, elevationAt, decode, goHome, waterStage, WATER, LAND,
 			get info() {
 				return {
 					exaggeration: scene.verticalExaggeration,
 					lighting: globe.enableLighting,
-					water: waterLayer.show,
-					waves: globe.showWaterEffect,
-					bakeMs: bakeMs,
+					water: waterStage.enabled,
+					waterReady: waterStage.ready,
+					waves: wavesOn,
+					logDepth: scene.logarithmicDepthBuffer,
+					toneMs: toneMs,
 					tilesLoaded: globe.tilesLoaded,
 					// 实测有没有真的打到 ion 的服务器(库里带着默认 token,光看 token 说明不了问题)
 					ionRequests: performance.getEntriesByType('resource')
