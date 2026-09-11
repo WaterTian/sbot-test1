@@ -54,6 +54,7 @@
 			font-family: 'IBM Plex Mono', 'JetBrains Mono', ui-monospace, 'PingFang SC', 'Hiragino Sans GB', 'Source Han Sans SC', 'Noto Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei', monospace;
 		}
 		input[type=range] { width: 100%; accent-color: var(--accent); margin: 0; }
+		input[type=range]:disabled { opacity: 0.4; }
 		.btns { display: flex; gap: 8px; flex-wrap: wrap; }
 		button {
 			flex: 1 1 auto; min-height: 32px; padding: 6px 12px;
@@ -98,6 +99,11 @@
 	<div id="panel" hidden>
 		<h1>Earth bathymetry · Cesium 版</h1>
 		<p class="sub">与 Three.js 复刻版同源数据的对照实现</p>
+
+		<div class="row">
+			<div class="cap" id="viewCap">视图 <b>V 键切换</b></div>
+			<div class="btns seg" id="viewSeg" role="group" aria-labelledby="viewCap"></div>
+		</div>
 
 		<div class="row">
 			<label for="exag">地形垂直夸张 <b id="exagVal">10×</b></label>
@@ -166,6 +172,11 @@
 		uniform float shoreWidth;      // 世界米(已夸张)
 		uniform float rimCap;          // 真实米
 		uniform float debugMode;
+		uniform float sceneMode;       // 0 = 3D 球面,1 = 2D 平面,其他(视图切换过程中)直接放行
+		uniform sampler2D heightMap;   // 2D 用:量不出深度,直接查高程图
+		uniform vec2 mapOrigin;        // 2D 用:屏幕左下角的经纬度(弧度)
+		uniform vec2 mapDu;            // 2D 用:沿屏幕横向走满一屏的经纬度增量
+		uniform vec2 mapDv;            // 2D 用:沿屏幕纵向走满一屏的经纬度增量
 		in vec2 v_textureCoordinates;
 
 		vec3 toLin(vec3 c) { return pow(max(c, vec3(0.0)), vec3(2.2)); }
@@ -206,9 +217,82 @@
 			return max((1.0 - r) * R0 / exaggeration, 0.0);
 		}
 
+		// 波浪:同一张法线贴图两层反向滚动,UV 按经纬度铺,与 Three.js 版球面 UV 一致。返回切空间法线
+		vec3 waveNormal(float lon, float lat) {
+			vec2 suv = vec2(lon / czm_twoPi + 0.5, lat / czm_pi + 0.5);
+			vec2 uv1 = suv * vec2(4.0, 2.0) + vec2(time * 0.010, time * 0.006);
+			vec2 uv2 = suv * vec2(4.0, 2.0) * 1.83 + vec2(-time * 0.008, time * 0.011);
+			vec3 n1 = texture(normalMap, fract(uv1)).xyz * 2.0 - 1.0;
+			vec3 n2 = texture(normalMap, fract(uv2)).xyz * 2.0 - 1.0;
+			return normalize(vec3((n1.xy + n2.xy) * 0.5 * normalScale * wavesOn, 1.0));
+		}
+
+		// 水体着色,3D、2D 共用。th = 光学厚度;n = 大地法线;N = 带波浪的法线;V = 指向观察者
+		vec3 shadeWater(vec3 floorCol, float th, vec3 n, vec3 N, vec3 V) {
+			vec3 L = normalize(czm_lightDirectionWC);
+			vec3 T = exp(-th / extinction);
+			float inscatter = 1.0 - exp(-th / visibility);
+			float deepMix = 1.0 - exp(-th * fadeSpeed / visibility);
+			vec3 waterCol = mix(shallowColor, deepColor, deepMix);
+
+			// Three.js 版的光总从正面来;这里有真实晨昏线,水体散射也得跟着日照走
+			float ndl = dot(n, L);
+			float lit = mix(1.0, 0.12 + 0.88 * smoothstep(-0.15, 0.3, ndl), lightOn);
+			vec3 col = floorCol * floorDim * T + waterCol * inscatter * lit;
+
+			vec3 H = normalize(L + V);
+			float spec = pow(max(dot(N, H), 0.0), shininess);
+			float fres = pow(1.0 - max(dot(n, V), 0.0), 5.0);
+			float sunSide = mix(1.0, smoothstep(-0.1, 0.25, ndl), lightOn);
+			col += vec3(specular) * spec * sunSide * wavesOn;
+			col += vec3(0.85, 0.9, 0.95) * fres * fresnelScale * lit;
+
+			col = col * exposure / (1.0 + col * exposure);           // Reinhard,同 Three.js 版
+			return toSrgb(col);
+		}
+
+		// ---- 2D 平面 ----
+		// 正交俯视 + 等经纬度投影,屏幕上的点到经纬度是个仿射映射(每帧由脚本按相机算好传进来)。
+		// 2D 下地形被压平,深度缓冲量不出水深,改为直接查高程图;视线垂直向下,穿水路程就是水深
+		vec2 lonLatAt(vec2 uv) { return mapOrigin + mapDu * uv.x + mapDv * uv.y; }
+
+		// 高程图灰度 → 水深(米,陆地与海岸带为 0),常数与脚本里的 decode 一致
+		float seaDepthAt(vec2 ll) {
+			vec2 t = vec2(fract(ll.x / czm_twoPi + 0.5), clamp(ll.y / czm_pi + 0.5, 0.0, 1.0));
+			float g = texture(heightMap, t).r * 255.0;
+			return max(130.0 - g, 0.0) / 130.0 * 8000.0;
+		}
+
+		vec4 water2D(vec2 uv, vec4 src) {
+			vec2 ll = lonLatAt(uv);
+			if (abs(ll.y) > czm_piOverTwo) return src;          // 地图上下边界以外
+			float d0 = seaDepthAt(ll);
+			float land = 1.0 - smoothstep(0.0, 60.0, d0);       // 60 米 ≈ 高程图一个灰阶
+			if (land > 0.999) return src;
+
+			float cl = cos(ll.y);
+			vec3 n = vec3(cl * cos(ll.x), cl * sin(ll.x), sin(ll.y));
+			vec3 east = vec3(-sin(ll.x), cos(ll.x), 0.0);
+			vec3 north = cross(n, east);
+			vec3 nt = waveNormal(ll.x, ll.y);
+			vec3 N = normalize(east * nt.x + north * nt.y + n * nt.z);
+
+			// 折射:正上方俯视,屏幕横纵就是东、北两个方向;偏到陆地上就不偏
+			vec2 ruv = uv + nt.xy * refractionScale * wavesOn;
+			float depth = seaDepthAt(lonLatAt(ruv));
+			vec3 floorCol = toLin(texture(colorTexture, ruv).rgb);
+			if (depth < 60.0) { floorCol = toLin(src.rgb); depth = d0; }
+
+			float th = depthK * depth * pow(max(depth, 30.0), depthPow - 1.0);
+			if (debugMode > 0.5) return vec4(vec3(depth / 10000.0), 1.0);
+			return vec4(mix(shadeWater(floorCol, th, n, N, n), src.rgb, land), 1.0);
+		}
+
 		void main(void) {
 			vec2 uv = v_textureCoordinates;
 			vec4 src = texture(colorTexture, uv);
+			if (sceneMode > 1.5) { out_FragColor = src; return; }
+			if (sceneMode > 0.5) { out_FragColor = water2D(uv, src); return; }
 
 			vec3 dirEC = viewDirEC(uv);
 			vec3 dirWC = normalize(czm_inverseViewRotation * dirEC);
@@ -226,18 +310,11 @@
 			vec3 n = normalize(p * radiiScale * radiiScale);          // 大地法线 ∝ p / 半径²
 			vec3 east = normalize(vec3(-n.y, n.x, 0.0) + vec3(1e-6, 0.0, 0.0));
 			vec3 north = cross(n, east);
-			vec3 L = normalize(czm_lightDirectionWC);
 			vec3 V = -dirWC;
 
-			// 波浪:同一张法线贴图两层反向滚动,UV 按经纬度铺,与 Three.js 版球面 UV 一致
 			float lon = atan(p.y, p.x);
 			float lat = asin(clamp(n.z, -1.0, 1.0));
-			vec2 suv = vec2(lon / czm_twoPi + 0.5, lat / czm_pi + 0.5);
-			vec2 uv1 = suv * vec2(4.0, 2.0) + vec2(time * 0.010, time * 0.006);
-			vec2 uv2 = suv * vec2(4.0, 2.0) * 1.83 + vec2(-time * 0.008, time * 0.011);
-			vec3 n1 = texture(normalMap, fract(uv1)).xyz * 2.0 - 1.0;
-			vec3 n2 = texture(normalMap, fract(uv2)).xyz * 2.0 - 1.0;
-			vec3 nt = normalize(vec3((n1.xy + n2.xy) * 0.5 * normalScale * wavesOn, 1.0));
+			vec3 nt = waveNormal(lon, lat);
 			vec3 N = normalize(east * nt.x + north * nt.y + n * nt.z);
 
 			// 折射:按波浪法线在屏幕上偏一点去取海底。偏过去的那个像素要用它自己那条视线的
@@ -272,25 +349,7 @@
 
 			if (debugMode > 0.5) { out_FragColor = vec4(vec3(path / 10000.0), 1.0); return; }
 
-			vec3 T = exp(-th / extinction);
-			float inscatter = 1.0 - exp(-th / visibility);
-			float deepMix = 1.0 - exp(-th * fadeSpeed / visibility);
-			vec3 waterCol = mix(shallowColor, deepColor, deepMix);
-
-			// Three.js 版的光总从正面来;这里有真实晨昏线,水体散射也得跟着日照走
-			float ndl = dot(n, L);
-			float lit = mix(1.0, 0.12 + 0.88 * smoothstep(-0.15, 0.3, ndl), lightOn);
-			vec3 col = floorCol * floorDim * T + waterCol * inscatter * lit;
-
-			vec3 H = normalize(L + V);
-			float spec = pow(max(dot(N, H), 0.0), shininess);
-			float fres = pow(1.0 - max(dot(n, V), 0.0), 5.0);
-			float sunSide = mix(1.0, smoothstep(-0.1, 0.25, ndl), lightOn);
-			col += vec3(specular) * spec * sunSide * wavesOn;
-			col += vec3(0.85, 0.9, 0.95) * fres * fresnelScale * lit;
-
-			col = col * exposure / (1.0 + col * exposure);           // Reinhard,同 Three.js 版
-			out_FragColor = vec4(mix(toSrgb(col), src.rgb, land), 1.0);
+			out_FragColor = vec4(mix(shadeWater(floorCol, th, n, N, V), src.rgb, land), 1.0);
 		}
 	`;
 
@@ -495,6 +554,21 @@
 		};
 		let wavesOn = true;
 
+		// 2D 下屏幕 → 经纬度的仿射映射,每帧按相机现算。等经纬度投影:x = 经度 × 赤道半径,y = 纬度 × 赤道半径;
+		// 2D 相机的位置、right、up 都在这个投影平面里,正交视锥的四边就是屏幕四边
+		const MAP2D = { origin: new Cesium.Cartesian2(), du: new Cesium.Cartesian2(), dv: new Cesium.Cartesian2() };
+		scene.preRender.addEventListener(() => {
+			if (scene.mode !== Cesium.SceneMode.SCENE2D) return;
+			const cam = scene.camera, f = cam.frustum, p = cam.position, r = cam.right, u = cam.up;
+			const w = f.right - f.left, h = f.top - f.bottom;
+			MAP2D.origin.x = (p.x + r.x * f.left + u.x * f.bottom) / R0;
+			MAP2D.origin.y = (p.y + r.y * f.left + u.y * f.bottom) / R0;
+			MAP2D.du.x = r.x * w / R0;
+			MAP2D.du.y = r.y * w / R0;
+			MAP2D.dv.x = u.x * h / R0;
+			MAP2D.dv.y = u.y * h / R0;
+		});
+
 		const waterStage = scene.postProcessStages.add(new Cesium.PostProcessStage({
 			name: 'bathymetryWater',
 			fragmentShader: WATER_FS,
@@ -523,13 +597,20 @@
 				// 岸线过渡带随夸张倍数缩放:夸张越大,海床离海面越远,过渡带也可以越宽
 				shoreWidth: () => Math.max(30 * scene.verticalExaggeration, 60),
 				rimCap: () => WATER.rimCap,
-				debugMode: () => WATER.debug
+				debugMode: () => WATER.debug,
+				sceneMode: () => (scene.mode === Cesium.SceneMode.SCENE3D ? 0 : scene.mode === Cesium.SceneMode.SCENE2D ? 1 : 2),
+				heightMap: HEIGHT_SRC,
+				mapOrigin: () => MAP2D.origin,
+				mapDu: () => MAP2D.du,
+				mapDv: () => MAP2D.dv
 			}
 		}));
 
 		const HOME = Cesium.Cartesian3.fromDegrees(-40, 10, 24000000);
-		function goHome() {
-			viewer.camera.flyTo({ destination: HOME, duration: 1.4 });
+		const WORLD = Cesium.Rectangle.fromDegrees(-180, -90, 180, 90);
+		function goHome(duration = 1.4) {
+			const destination = scene.mode === Cesium.SceneMode.SCENE2D ? WORLD : HOME;
+			viewer.camera.flyTo({ destination, duration });
 		}
 		viewer.camera.setView({ destination: HOME });
 
@@ -554,7 +635,7 @@
 		toggle('btnWater', (on) => { waterStage.enabled = on; });
 		toggle('btnWaves', (on) => { wavesOn = on; });
 		toggle('btnLight', (on) => { globe.enableLighting = on; });
-		document.getElementById('btnHome').addEventListener('click', goHome);
+		document.getElementById('btnHome').addEventListener('click', () => goHome());
 
 		// 水色:Three.js 版那五档,参数逐项照搬(深度那条轴的映射与档位无关,不用跟着调)
 		const WATER_PRESETS = [
@@ -612,11 +693,28 @@
 		applyQuality(0);
 		window.addEventListener('resize', () => applyQuality(qualityIndex));
 
+		// 视图:3D 球面 / 2D 平面(等经纬度投影的世界地图)。2D 下地形被压平,垂直夸张不起作用。
+		// 切换不走 Cesium 的变形动画:变形途中既不是球也不是平面,水体没法算,只能露出没有水的海床
+		const VIEWS = [{ name: '3D 球面' }, { name: '2D 平面' }];
+		let viewIndex = 0;
+		const markView = segmented('viewSeg', VIEWS, (i) => applyView(i));
+		function applyView(i) {
+			if (i === viewIndex) return;
+			viewIndex = i;
+			markView(i);
+			exag.disabled = i === 1;
+			if (i === 1) scene.morphTo2D(0);
+			else scene.morphTo3D(0);
+		}
+		scene.morphComplete.addEventListener(() => goHome(0));   // 换完回到该视图的默认视角
+		markView(0);
+
 		document.addEventListener('keydown', (e) => {
 			if (e.ctrlKey || e.metaKey || e.altKey) return;
 			const k = e.key.toLowerCase();
 			if (k === 'w') applyWaterPreset((waterIndex + 1) % WATER_PRESETS.length);
 			else if (k === 'u') applyQuality((qualityIndex + 1) % QUALITY.length);
+			else if (k === 'v') applyView(1 - viewIndex);
 		});
 
 		// --------------------------------------------------------------
@@ -648,7 +746,7 @@
 		});
 
 		window.APP = {
-			Cesium, viewer, scene, elevationAt, decode, goHome, waterStage, WATER, applyWaterPreset, applyQuality,
+			Cesium, viewer, scene, elevationAt, decode, goHome, waterStage, WATER, applyWaterPreset, applyQuality, applyView, MAP2D,
 			get info() {
 				return {
 					exaggeration: scene.verticalExaggeration,
@@ -658,6 +756,8 @@
 					waves: wavesOn,
 					waterPreset: WATER_PRESETS[waterIndex].name,
 					quality: QUALITY[qualityIndex].name,
+					view: VIEWS[viewIndex].name,
+					sceneMode: scene.mode,
 					pixelRatio: scene.pixelRatio,
 					canvas: [scene.canvas.width, scene.canvas.height],
 					logDepth: scene.logarithmicDepthBuffer,
