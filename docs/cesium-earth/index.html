@@ -45,11 +45,11 @@
 		#panel .sub { color: var(--secondary); font-size: 13px; margin: 0 0 16px; }
 		.row { margin-bottom: 16px; }
 		.row:last-child { margin-bottom: 0; }
-		.row label {
+		.row label, .row .cap {
 			display: flex; justify-content: space-between; align-items: baseline;
 			color: var(--secondary); font-size: 13px; margin-bottom: 8px;
 		}
-		.row label b {
+		.row label b, .row .cap b {
 			color: var(--accent); font-weight: 500;
 			font-family: 'IBM Plex Mono', 'JetBrains Mono', ui-monospace, 'PingFang SC', 'Hiragino Sans GB', 'Source Han Sans SC', 'Noto Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei', monospace;
 		}
@@ -63,6 +63,9 @@
 		}
 		button:hover { border-color: var(--accent); color: var(--accent); }
 		button[aria-pressed=true] { border-color: var(--accent); color: var(--accent); }
+		/* 分段选择:等宽平分一行,五个两字按钮也放得下 */
+		.seg { flex-wrap: nowrap; }
+		.seg button { flex: 1 1 0; padding: 6px 0; }
 
 		#note {
 			margin-top: 16px; padding-top: 16px;
@@ -99,6 +102,16 @@
 		<div class="row">
 			<label for="exag">地形垂直夸张 <b id="exagVal">10×</b></label>
 			<input type="range" id="exag" min="1" max="40" step="1" value="10">
+		</div>
+
+		<div class="row">
+			<div class="cap" id="waterCap">水色 <b>W 键轮换</b></div>
+			<div class="btns seg" id="waterSeg" role="group" aria-labelledby="waterCap"></div>
+		</div>
+
+		<div class="row">
+			<div class="cap" id="qualityCap">画质 <b>U 键轮换</b></div>
+			<div class="btns seg" id="qualitySeg" role="group" aria-labelledby="qualityCap"></div>
 		</div>
 
 		<div class="row btns">
@@ -441,7 +454,6 @@
 		scene.verticalExaggeration = 10;
 		scene.verticalExaggerationRelativeHeight = 0;   // 以海平面为基准放大
 		globe.enableLighting = true;
-		globe.maximumScreenSpaceError = 3;
 		// Cesium 的日照跟真实时间走。把钟停在太阳正对大西洋的时刻,
 		// 否则默认打开就是一片夜面 —— 这是它「按真实天文算」的代价。
 		viewer.clock.currentTime = Cesium.JulianDate.fromIso8601('2026-09-10T15:00:00Z');
@@ -544,6 +556,69 @@
 		toggle('btnLight', (on) => { globe.enableLighting = on; });
 		document.getElementById('btnHome').addEventListener('click', goHome);
 
+		// 水色:Three.js 版那五档,参数逐项照搬(深度那条轴的映射与档位无关,不用跟着调)
+		const WATER_PRESETS = [
+			{ name: '清澈', floor: 0.35, visibility: 25, fade: 0.8, shallow: [0.10, 0.42, 0.46], deep: [0.004, 0.020, 0.026], ext: [6, 30, 32] },
+			{ name: '通透', floor: 0.45, visibility: 35, fade: 0.7, shallow: [0.10, 0.42, 0.46], deep: [0.004, 0.020, 0.026], ext: [8, 40, 44] },
+			{ name: '浑浊', floor: 0.30, visibility: 10, fade: 1.0, shallow: [0.10, 0.42, 0.46], deep: [0.004, 0.020, 0.026], ext: [2.5, 12, 13] },
+			{ name: '琥珀', floor: 0.35, visibility: 25, fade: 0.8, shallow: [0.62, 0.40, 0.08], deep: [0.10, 0.012, 0.004], ext: [32, 16, 8] },
+			{ name: '灰色', floor: 0.40, visibility: 30, fade: 0.8, shallow: [0.55, 0.55, 0.55], deep: [0.03, 0.03, 0.03], ext: [26, 26, 26] }
+		];
+		// 画质:标准按 CSS 像素渲染;高清按屏幕真实像素(高分屏上清晰一倍);超清再翻一倍 ——
+		// 对应 Three.js 版的 ultra / photo。瓦片细分阈值跟着收紧。
+		// 渲染缓冲封顶约 1600 万像素,和 Three.js 版一样,免得超清把显存吃爆
+		const QUALITY = [
+			{ name: '标准', dpr: false, scale: 1, sse: 3 },
+			{ name: '高清', dpr: true, scale: 1, sse: 2 },
+			{ name: '超清', dpr: true, scale: 2, sse: 1.5 }
+		];
+		let waterIndex = 0, qualityIndex = 0;
+
+		function segmented(id, items, onPick) {
+			const box = document.getElementById(id);
+			const btns = items.map((it, i) => {
+				const b = document.createElement('button');
+				b.textContent = it.name;
+				b.addEventListener('click', () => onPick(i));
+				box.append(b);
+				return b;
+			});
+			return (i) => btns.forEach((b, k) => b.setAttribute('aria-pressed', String(k === i)));
+		}
+		const markWater = segmented('waterSeg', WATER_PRESETS, (i) => applyWaterPreset(i));
+		const markQuality = segmented('qualitySeg', QUALITY, (i) => applyQuality(i));
+
+		function applyWaterPreset(i) {
+			const p = WATER_PRESETS[i];
+			WATER.floorDim = p.floor;
+			WATER.visibility = p.visibility;
+			WATER.fadeSpeed = p.fade;
+			WATER.shallowColor = new Cesium.Cartesian3(...p.shallow);
+			WATER.deepColor = new Cesium.Cartesian3(...p.deep);
+			WATER.extinction = new Cesium.Cartesian3(...p.ext);
+			waterIndex = i;
+			markWater(i);
+		}
+		function applyQuality(i) {
+			const q = QUALITY[i];
+			viewer.useBrowserRecommendedResolution = !q.dpr;
+			const px = window.innerWidth * window.innerHeight * ((q.dpr ? window.devicePixelRatio : 1) * q.scale) ** 2;
+			viewer.resolutionScale = px > 16e6 ? q.scale * Math.sqrt(16e6 / px) : q.scale;
+			globe.maximumScreenSpaceError = q.sse;
+			qualityIndex = i;
+			markQuality(i);
+		}
+		applyWaterPreset(0);
+		applyQuality(0);
+		window.addEventListener('resize', () => applyQuality(qualityIndex));
+
+		document.addEventListener('keydown', (e) => {
+			if (e.ctrlKey || e.metaKey || e.altKey) return;
+			const k = e.key.toLowerCase();
+			if (k === 'w') applyWaterPreset((waterIndex + 1) % WATER_PRESETS.length);
+			else if (k === 'u') applyQuality((qualityIndex + 1) % QUALITY.length);
+		});
+
 		// --------------------------------------------------------------
 		// 状态行:鼠标底下那一点的经纬度与海拔 —— Three.js 那版给不出这个
 
@@ -573,7 +648,7 @@
 		});
 
 		window.APP = {
-			Cesium, viewer, scene, elevationAt, decode, goHome, waterStage, WATER,
+			Cesium, viewer, scene, elevationAt, decode, goHome, waterStage, WATER, applyWaterPreset, applyQuality,
 			get info() {
 				return {
 					exaggeration: scene.verticalExaggeration,
@@ -581,6 +656,10 @@
 					water: waterStage.enabled,
 					waterReady: waterStage.ready,
 					waves: wavesOn,
+					waterPreset: WATER_PRESETS[waterIndex].name,
+					quality: QUALITY[qualityIndex].name,
+					pixelRatio: scene.pixelRatio,
+					canvas: [scene.canvas.width, scene.canvas.height],
 					logDepth: scene.logarithmicDepthBuffer,
 					cdn: cdn,
 					timing: timing,
